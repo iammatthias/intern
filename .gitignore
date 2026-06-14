@@ -1,0 +1,10 @@
+# Local secrets / env
+*.env
+.env
+intern-setup.env
+
+# Generated pairing artifacts
+r1-pairing*.png
+
+# OS cruft
+.DS_Store
