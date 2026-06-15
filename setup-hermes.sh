@@ -750,6 +750,10 @@ stage_honcho() {
   # Honcho's default pgvector schema, so no DB rebuild. Override for a different provider/model.
   local honcho_embed_base="${HONCHO_EMBED_BASE_URL:-$honcho_base_url}"
   local honcho_embed_model="${HONCHO_EMBED_MODEL:-openai/text-embedding-3-small}"
+  # Dialectic does tool-calling over memory; give it an explicit tool-capable model. Its per-level
+  # configs default to OpenAI, which 401s with an OpenRouter key (a top-level DIALECTIC_MODEL_CONFIG
+  # is ignored — the dialectic reads DIALECTIC_LEVELS__<level>__MODEL_CONFIG__* instead).
+  local honcho_dialectic_model="${HONCHO_DIALECTIC_MODEL:-google/gemini-2.5-flash}"
   if [ ! -f "$HONCHO_DIR/.env" ]; then
     {
       echo "# Honcho self-hosted config (written by setup-hermes.sh)"
@@ -759,10 +763,18 @@ stage_honcho() {
         echo ""
         echo "# Generative models routed to an OpenAI-compatible provider (e.g. OpenRouter)."
         local feat
-        for feat in DERIVER DIALECTIC SUMMARY DREAM; do
+        for feat in DERIVER SUMMARY DREAM; do
           echo "${feat}_MODEL_CONFIG__TRANSPORT=openai"
           [ -n "$honcho_model" ] && echo "${feat}_MODEL_CONFIG__MODEL=${honcho_model}"
           echo "${feat}_MODEL_CONFIG__OVERRIDES__BASE_URL=${honcho_base_url}"
+        done
+        # Dialectic uses PER-LEVEL model configs; a top-level DIALECTIC_MODEL_CONFIG is IGNORED.
+        # Point every reasoning level at the provider so memory queries don't 401 against OpenAI.
+        local dlvl
+        for dlvl in minimal low medium high max; do
+          echo "DIALECTIC_LEVELS__${dlvl}__MODEL_CONFIG__TRANSPORT=openai"
+          echo "DIALECTIC_LEVELS__${dlvl}__MODEL_CONFIG__MODEL=${honcho_dialectic_model}"
+          echo "DIALECTIC_LEVELS__${dlvl}__MODEL_CONFIG__OVERRIDES__BASE_URL=${honcho_base_url}"
         done
       fi
       if [ -n "$honcho_embed_base" ]; then
