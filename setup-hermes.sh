@@ -25,8 +25,8 @@
 #   HONCHO_EMBED_BASE_URL   Embedding endpoint (default: HONCHO_LLM_BASE_URL)
 #   OPENROUTER_API_KEY      Hermes LLM key for the unpaired/BYO path (defaults to reusing the
 #                           Honcho OpenRouter key, so one key configures both)
-#   HERMES_MODEL            Hermes default model (default: openrouter/owl-alpha)
-#   HERMES_FALLBACK_MODEL   Hermes fallback model (default: openrouter/auto)
+#   HERMES_MODEL            Optionally pin the default chat model (default: unset — pick it in
+#                           the dashboard). HERMES_FALLBACK_MODEL adds an explicit fallback.
 #   R1_SHIM_ENABLED         1 (default) | 0 — install the Rabbit R1 channel (third-party shim)
 #   R1_SHIM_TOKEN           Fixed R1 pairing token (default: auto-generated; keeps the QR stable)
 #   R1_SHIM_PORT            R1 shim WebSocket port (default: 18790)
@@ -97,8 +97,11 @@ DEVICE_CONFIG="/root/config/config.json"
 # Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own
 # OpenRouter. Reuses the Honcho OpenRouter key by default (one key configures both).
 OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
-HERMES_MODEL="${HERMES_MODEL:-openrouter/owl-alpha}"
-HERMES_FALLBACK_MODEL="${HERMES_FALLBACK_MODEL:-openrouter/auto}"
+# No default chat model is pinned — choose it in the Hermes dashboard (its picker lists
+# OpenRouter models). Set HERMES_MODEL to pin one anyway (e.g. a stealth model the picker
+# won't list); HERMES_FALLBACK_MODEL adds an explicit fallback. Empty (default) = unset.
+HERMES_MODEL="${HERMES_MODEL:-}"
+HERMES_FALLBACK_MODEL="${HERMES_FALLBACK_MODEL:-}"
 # Vision/multimodal auxiliary model. openrouter/auto is NOT image-capable (returns
 # "No endpoints found that support image input"), so image understanding — e.g. R1
 # camera photos via vision_analyze — needs an explicit multimodal model here.
@@ -966,21 +969,27 @@ YAML
   elif [ -n "$or_key" ]; then
     have_llm=1
     # Bring-your-own OpenRouter (Hermes built-in provider). The key goes in .env (step 5).
-    # An explicit model.default + fallback_model works even for new stealth models the
-    # dashboard picker doesn't list yet (e.g. openrouter/owl-alpha).
-    cat >"$HERMES_HOME_DIR/config.yaml" <<YAML
-model:
-  default: '${HERMES_MODEL}'
-  provider: openrouter
-fallback_model:
-  provider: openrouter
-  model: '${HERMES_FALLBACK_MODEL}'
+    # We configure the provider but DELIBERATELY pin no default chat model — pick it in the
+    # Hermes dashboard (its picker lists OpenRouter models). To pin one anyway (e.g. a stealth
+    # model the picker won't list), set HERMES_MODEL (+ optional HERMES_FALLBACK_MODEL).
+    {
+      echo "model:"
+      echo "  provider: openrouter"
+      [ -n "$HERMES_MODEL" ] && echo "  default: '${HERMES_MODEL}'"
+      if [ -n "$HERMES_FALLBACK_MODEL" ]; then
+        echo "fallback_model:"
+        echo "  provider: openrouter"
+        echo "  model: '${HERMES_FALLBACK_MODEL}'"
+      fi
+    } >"$HERMES_HOME_DIR/config.yaml"
+    cat >>"$HERMES_HOME_DIR/config.yaml" <<YAML
 memory:
   provider: honcho
 # Pin every auxiliary task (vision, compression, title-gen, …) to OpenRouter. Hermes' auxiliary
 # "auto" resolver otherwise walks a hardcoded chain [openrouter, nous, …] and probes Nous'
 # inference-api as a fallback — which 402s without Nous credits and spams the log. An explicit
-# provider+model bypasses the chain entirely, so Nous is never contacted.
+# provider+model bypasses the chain entirely, so Nous is never contacted. (These are functional
+# requirements — vision needs a multimodal model — NOT a user-facing default chat model.)
 auxiliary:
   vision: {provider: openrouter, model: ${HERMES_VISION_MODEL}}
   web_extract: {provider: openrouter, model: ${HERMES_VISION_MODEL}}
@@ -994,7 +1003,11 @@ auxiliary:
   profile_describer: {provider: openrouter, model: openrouter/auto}
   curator: {provider: openrouter, model: openrouter/auto}
 YAML
-    echo "[stage] Hermes LLM: OpenRouter, default=${HERMES_MODEL}, fallback=${HERMES_FALLBACK_MODEL}"
+    if [ -n "$HERMES_MODEL" ]; then
+      echo "[stage] Hermes LLM: OpenRouter, default=${HERMES_MODEL}"
+    else
+      echo "[stage] Hermes LLM: OpenRouter configured — no default model pinned (pick one in the dashboard)"
+    fi
   else
     echo "[stage] WARN: no Autonomous pairing and no OpenRouter key (OPENROUTER_API_KEY / Honcho OpenRouter)."
     echo "        Writing memory-only config.yaml; set a provider in the dashboard or re-run with a key."

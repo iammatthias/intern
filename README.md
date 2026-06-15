@@ -64,7 +64,7 @@ TS_AUTHKEY=tskey-... \
 | `OPENROUTER_API_KEY` | LLM key for Hermes (reused for Honcho if `HONCHO_*` not set) |
 | `HONCHO_LLM_OPENAI_API_KEY` / `HONCHO_LLM_BASE_URL` / `HONCHO_LLM_MODEL` | Honcho generation + embeddings provider |
 | `HONCHO_EMBED_MODEL` / `HONCHO_EMBED_BASE_URL` | Honcho embeddings (default `openai/text-embedding-3-small` @ 1536 dims, via the generation base URL) |
-| `HERMES_MODEL` / `HERMES_FALLBACK_MODEL` | default `openrouter/owl-alpha` / `openrouter/auto` |
+| `HERMES_MODEL` / `HERMES_FALLBACK_MODEL` | optional — pin a chat model; default **unset** (pick it in the dashboard) |
 | `HERMES_BRANCH` | Hermes release tag (default `v2026.6.5`) |
 | `R1_SHIM_ENABLED` / `R1_SHIM_TOKEN` / `R1_SHIM_PORT` | Rabbit R1 channel: on by default, token auto-generated (fixed), port `18790` |
 | `R1_SHIM_REPO_RAW` | Source of the `r1_shim` adapter + Hermes patch ([iammatthias/r1-hermes-shim][r1-shim]) |
