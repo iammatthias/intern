@@ -99,6 +99,10 @@ DEVICE_CONFIG="/root/config/config.json"
 OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
 HERMES_MODEL="${HERMES_MODEL:-openrouter/owl-alpha}"
 HERMES_FALLBACK_MODEL="${HERMES_FALLBACK_MODEL:-openrouter/auto}"
+# Vision/multimodal auxiliary model. openrouter/auto is NOT image-capable (returns
+# "No endpoints found that support image input"), so image understanding — e.g. R1
+# camera photos via vision_analyze — needs an explicit multimodal model here.
+HERMES_VISION_MODEL="${HERMES_VISION_MODEL:-google/gemini-2.5-flash}"
 
 # Rabbit R1 channel. r1_shim is a THIRD-PARTY shim (github.com/iammatthias/r1-hermes-shim),
 # NOT an upstream Hermes feature — upstream Hermes does not ship it. stage_hermes installs it
@@ -966,8 +970,8 @@ memory:
 # inference-api as a fallback — which 402s without Nous credits and spams the log. An explicit
 # provider+model bypasses the chain entirely, so Nous is never contacted.
 auxiliary:
-  vision: {provider: openrouter, model: openrouter/auto}
-  web_extract: {provider: openrouter, model: openrouter/auto}
+  vision: {provider: openrouter, model: ${HERMES_VISION_MODEL}}
+  web_extract: {provider: openrouter, model: ${HERMES_VISION_MODEL}}
   compression: {provider: openrouter, model: openrouter/auto}
   skills_hub: {provider: openrouter, model: openrouter/auto}
   approval: {provider: openrouter, model: openrouter/auto}
