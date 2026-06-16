@@ -418,8 +418,8 @@ stage_gateway_shim() {
 #!/usr/bin/env python3
 # Minimal WebSocket shim on 127.0.0.1:18789 standing in for the OpenClaw gateway so
 # intern-server's LED/lifecycle client connects cleanly instead of reconnect-looping.
-# Greets the client, answers its JSON-RPC `connect` handshake, pongs pings. No events
-# are pushed (LED stays idle). Pure stdlib, no deps.
+# Greets the client, answers its JSON-RPC `connect` handshake, pongs pings, and sends a
+# 25s heartbeat so its ~60s read deadline never fires (no reconnect loop). Pure stdlib.
 import base64
 import hashlib
 import json
@@ -507,19 +507,37 @@ def send_frame(conn, opcode, payload=b""):
 
 
 def handle(conn, addr):
+    send_lock = threading.Lock()
+    closed = threading.Event()
+
+    def locked_send(opcode, payload=b""):
+        with send_lock:
+            send_frame(conn, opcode, payload)
+
     try:
         if not handshake(conn):
             conn.close()
             return
         print(f"client connected {addr}", flush=True)
         try:
-            send_frame(conn, 0x1, json.dumps({
+            locked_send(0x1, json.dumps({
                 "method": "connected",
                 "params": {"protocol": 3, "server": {"id": "intern-gateway-shim", "mode": "gateway", "version": "1.0"}},
             }).encode("utf-8"))
         except OSError:
             conn.close()
             return
+
+        # Heartbeat every 25s so intern-server's ~60s read deadline never fires (else it
+        # reconnect-loops). A no-id notification the client harmlessly ignores.
+        def keepalive():
+            while not closed.wait(25):
+                try:
+                    locked_send(0x1, b'{"method":"ping"}')
+                except OSError:
+                    break
+        threading.Thread(target=keepalive, daemon=True).start()
+
         logged = 0
         while True:
             fr = recv_frame(conn)
@@ -528,12 +546,15 @@ def handle(conn, addr):
             opcode, payload = fr
             if opcode == 0x8:
                 try:
-                    send_frame(conn, 0x8)
+                    locked_send(0x8)
                 except OSError:
                     pass
                 break
             if opcode == 0x9:
-                send_frame(conn, 0xA, payload)
+                try:
+                    locked_send(0xA, payload)
+                except OSError:
+                    break
                 continue
             if opcode not in (0x1, 0x2):
                 continue
@@ -560,12 +581,13 @@ def handle(conn, addr):
             else:
                 result = {}
             try:
-                send_frame(conn, 0x1, json.dumps({"id": mid, "result": result}).encode("utf-8"))
+                locked_send(0x1, json.dumps({"id": mid, "result": result}).encode("utf-8"))
             except OSError:
                 break
     except OSError:
         pass
     finally:
+        closed.set()
         try:
             conn.close()
         except OSError:
@@ -1225,6 +1247,24 @@ SyslogIdentifier=hermes-dashboard
 [Install]
 WantedBy=multi-user.target
 EOF
+  # The dashboard serves a prebuilt web dist via --skip-build, but a fresh Hermes install ships
+  # only the web/ source — build the dist once here, else the service crash-loops with
+  # "--skip-build was passed but no web dist found". Idempotent (skips if already built).
+  local hsrc="" hd
+  for hd in /usr/local/lib/hermes-agent "$HERMES_HOME_DIR/hermes-agent"; do
+    [ -f "$hd/web/package.json" ] && hsrc="$hd" && break
+  done
+  if [ -n "$hsrc" ] && [ ! -f "$hsrc/hermes_cli/web_dist/index.html" ]; then
+    echo "[stage] Building Hermes dashboard web dist (one-time; can take a few minutes on a Pi)"
+    local npath="/root/.hermes/node/bin:$hsrc/node_modules/.bin:$PATH"
+    if ( cd "$hsrc/web" && HOME=/root PATH="$npath" npm install --no-audit --no-fund \
+           && HOME=/root PATH="$npath" npm run build ); then
+      echo "[stage] dashboard web dist built"
+    else
+      echo "[stage] WARN: dashboard web build failed — it won't serve until you run: cd $hsrc/web && npm run build"
+    fi
+  fi
+
   systemctl daemon-reload
   systemctl enable hermes-dashboard
   systemctl restart hermes-dashboard
