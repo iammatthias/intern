@@ -44,6 +44,10 @@
 #   SKIP_REBOOT=1           Don't reboot at the end (otherwise reboots to apply SPI/WiFi firmware)
 #   SKIP_FIREWALL=1         Don't apply the tailnet-only firewall lockdown — keeps the dashboard +
 #                           SSH reachable over the LAN. Useful on a dev box you reach over the LAN.
+#   LAN_SSH_CIDR            With the firewall on, also allow SSH (port 22 only) from this home LAN
+#                           subnet — "auto" (detect the LAN /24) or a CIDR like 192.168.1.0/24.
+#                           Default unset = SSH stays tailnet-only. Dashboard/API ports always
+#                           stay tailnet-only regardless.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -1648,6 +1652,14 @@ set -e
 # 22 ssh, 80 setup-web, 443 dashboard, 5000 intern-server API, 8080 bootstrap-server.
 # (Tailnet SSH uses the regular sshd reachable via tailscale0, which is exempted below.)
 LOCKED_PORTS="22,80,443,5000,8080"
+# Optionally also allow SSH (port 22 ONLY) from a home LAN subnet — key-auth, low risk, and a
+# reliable path when the tailnet tunnel is flaky. Dashboard/API ports stay tailnet-only.
+# "" = tailnet-only (default); "auto" = detect this host's LAN /24; or an explicit CIDR.
+LAN_SSH_CIDR="__LAN_SSH_CIDR__"
+if [ "$LAN_SSH_CIDR" = "auto" ]; then
+  _lan_if="$(ip route show default 2>/dev/null | awk '{print $5; exit}')"
+  LAN_SSH_CIDR="$(ip -4 -o addr show "$_lan_if" 2>/dev/null | awk '{print $4; exit}' | sed -E 's#\.[0-9]+/[0-9]+#.0/24#')"
+fi
 
 iptables -N INTERN-LOCK 2>/dev/null || iptables -F INTERN-LOCK
 iptables -A INTERN-LOCK -i lo -j RETURN
@@ -1656,11 +1668,15 @@ iptables -A INTERN-LOCK -i tailscale0 -j RETURN
 iptables -A INTERN-LOCK -s 192.168.100.0/24 -j RETURN
 # Don't sever the session that is running this script (e.g. SSH over LAN during provisioning)
 iptables -A INTERN-LOCK -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+# Home-LAN SSH (opt-in): port 22 only, from LAN_SSH_CIDR
+[ -n "$LAN_SSH_CIDR" ] && iptables -A INTERN-LOCK -s "$LAN_SSH_CIDR" -p tcp --dport 22 -j RETURN
 iptables -A INTERN-LOCK -p tcp -m multiport --dports "$LOCKED_PORTS" -j DROP
 
 iptables -C INPUT -j INTERN-LOCK 2>/dev/null || iptables -I INPUT 1 -j INTERN-LOCK
-echo "intern-firewall: ports $LOCKED_PORTS restricted to lo/tailscale0/192.168.100.0/24"
+echo "intern-firewall: $LOCKED_PORTS tailnet-only${LAN_SSH_CIDR:+; SSH also from $LAN_SSH_CIDR}"
 EOF
+  # Inject the operator's choice (empty = tailnet-only, "auto", or an explicit CIDR).
+  sed -i "s|__LAN_SSH_CIDR__|${LAN_SSH_CIDR:-}|" /usr/local/bin/intern-firewall
   chmod +x /usr/local/bin/intern-firewall
 
   cat >/etc/systemd/system/intern-firewall.service <<'EOF'
