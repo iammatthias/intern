@@ -4,7 +4,7 @@
 #   - Caddy            setup web UI + API proxy (Cloudsmith apt repo)
 #   - intern backend   the Autonomous intern-server (LED ring, Wi-Fi onboarding API)
 #   - Hermes agent     gateway as a systemd service, pinned to a release tag
-#   - Honcho           self-hosted memory (Docker Compose on 127.0.0.1:8000)
+#                      (memory = Hermes' built-in MEMORY.md + skills/procedural; no external store)
 #   - Tailscale        SSH over the tailnet + the Hermes dashboard published tailnet-only
 #   - Rabbit R1        optional OpenClaw-compatible channel (third-party r1_shim) + pairing QR
 #   - Firewall         iptables lockdown of 22/80/443/5000/8080 on physical interfaces
@@ -17,14 +17,7 @@
 #   TS_AUTHKEY              Tailscale auth key for unattended join (else: run `tailscale up` later)
 #   TS_HOSTNAME             Tailnet hostname (default: intern-<serial suffix>)
 #   HERMES_BRANCH           Hermes installer release tag (default: v2026.6.5 == v0.16.0)
-#   HONCHO_LLM_OPENAI_API_KEY  LLM key for Honcho's generative models (falls back to OPENAI_API_KEY)
-#   HONCHO_LLM_BASE_URL     Optional OpenAI-compatible base URL for Honcho generation + embeddings
-#                           (e.g. https://openrouter.ai/api/v1 — OpenRouter serves both).
-#   HONCHO_LLM_MODEL        Optional model id for Honcho generation (e.g. openrouter/auto)
-#   HONCHO_EMBED_MODEL      Honcho embedding model (default: openai/text-embedding-3-small, 1536 dims)
-#   HONCHO_EMBED_BASE_URL   Embedding endpoint (default: HONCHO_LLM_BASE_URL)
-#   OPENROUTER_API_KEY      Hermes LLM key for the unpaired/BYO path (defaults to reusing the
-#                           Honcho OpenRouter key, so one key configures both)
+#   OPENROUTER_API_KEY      Hermes LLM key for the unpaired/BYO path
 #   HERMES_MODEL            Optionally pin the default chat model (default: unset — pick it in
 #                           the dashboard). HERMES_FALLBACK_MODEL adds an explicit fallback.
 #   R1_SHIM_ENABLED         1 (default) | 0 — install the Rabbit R1 channel (third-party shim)
@@ -89,7 +82,6 @@ AP_BAND="${AP_BAND:-2.4}"       # 2.4 or 5 (5 GHz for better throughput)
 AP_CHANNEL="${AP_CHANNEL:-}"    # default: 6 (2.4 GHz) or 36 (5 GHz); override e.g. AP_CHANNEL=11 or 40
 
 WEB_ROOT="/usr/share/caddy/setup"
-HONCHO_DIR="${HONCHO_DIR:-/opt/honcho}"
 HERMES_HOME_DIR="/root/.hermes"
 # Pinned Hermes release tag (== v0.16.0). Bump to track upstream; the installer's
 # `--branch` accepts tags. NB: the device-runtime doc pins v2026.4.30, but that ref
@@ -98,8 +90,7 @@ HERMES_HOME_DIR="/root/.hermes"
 HERMES_BRANCH="${HERMES_BRANCH:-v2026.6.5}"
 # Pairing-time device config (LLM key/model/base_url, channel tokens, active_agent)
 DEVICE_CONFIG="/root/config/config.json"
-# Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own
-# OpenRouter. Reuses the Honcho OpenRouter key by default (one key configures both).
+# Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own OpenRouter.
 OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
 # No default chat model is pinned — choose it in the Hermes dashboard (its picker lists
 # OpenRouter models). Set HERMES_MODEL to pin one anyway (e.g. a stealth model the picker
@@ -733,117 +724,6 @@ stage_tailscale() {
 }
 
 # ----------------------------------------------------------
-# Stage 1b: Self-hosted Honcho (memory backend for Hermes)
-# Docker Compose stack: api :8000, deriver worker, Postgres+pgvector, Redis.
-# Everything binds to 127.0.0.1; only Hermes on this box talks to it.
-# ----------------------------------------------------------
-stage_honcho() {
-  echo "[stage] Install self-hosted Honcho"
-
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "[stage] Install Docker (get.docker.com)"
-    # The convenience script can lag a brand-new Debian release (no trixie repo
-    # yet); fall back to Debian's own packages, which ship the compose v2 plugin.
-    if ! retry "curl -fsSL https://get.docker.com | sh" 3; then
-      echo "[stage] get.docker.com failed; falling back to Debian docker.io + docker-compose-v2"
-      apt update
-      apt install -y docker.io docker-compose-v2 || { echo "ERROR: Docker install failed"; exit 1; }
-    fi
-  fi
-  systemctl enable --now docker
-  # The stack uses `docker compose` (v2 plugin), not the legacy `docker-compose`.
-  if ! docker compose version >/dev/null 2>&1; then
-    echo "ERROR: 'docker compose' (v2) unavailable after install"
-    exit 1
-  fi
-
-  if [ -d "$HONCHO_DIR/.git" ]; then
-    git -C "$HONCHO_DIR" pull --ff-only || true
-  else
-    retry "git clone --depth 1 https://github.com/plastic-labs/honcho '$HONCHO_DIR'" 5
-  fi
-
-  if [ ! -f "$HONCHO_DIR/docker-compose.yml" ]; then
-    cp "$HONCHO_DIR/docker-compose.yml.example" "$HONCHO_DIR/docker-compose.yml"
-  fi
-
-  # Honcho's deriver needs one OpenAI-compatible LLM key; the server won't start without it.
-  local honcho_key="${HONCHO_LLM_OPENAI_API_KEY:-${OPENAI_API_KEY:-}}"
-  # Optional OpenAI-compatible provider override (OpenRouter, Ollama, vLLM, ...).
-  # When HONCHO_LLM_BASE_URL is set, all four generative model configs are pointed at it.
-  local honcho_base_url="${HONCHO_LLM_BASE_URL:-}"
-  local honcho_model="${HONCHO_LLM_MODEL:-}"
-  # Embeddings: OpenRouter now serves an OpenAI-compatible /v1/embeddings endpoint, so the same
-  # base_url + key cover embeddings too (no separate OpenAI account needed). Defaults to the
-  # generation base_url + openai/text-embedding-3-small, which returns 1536 dims — matching
-  # Honcho's default pgvector schema, so no DB rebuild. Override for a different provider/model.
-  local honcho_embed_base="${HONCHO_EMBED_BASE_URL:-$honcho_base_url}"
-  local honcho_embed_model="${HONCHO_EMBED_MODEL:-openai/text-embedding-3-small}"
-  # Dialectic does tool-calling over memory; give it an explicit tool-capable model. Its per-level
-  # configs default to OpenAI, which 401s with an OpenRouter key (a top-level DIALECTIC_MODEL_CONFIG
-  # is ignored — the dialectic reads DIALECTIC_LEVELS__<level>__MODEL_CONFIG__* instead).
-  local honcho_dialectic_model="${HONCHO_DIALECTIC_MODEL:-google/gemini-2.5-flash}"
-  if [ ! -f "$HONCHO_DIR/.env" ]; then
-    {
-      echo "# Honcho self-hosted config (written by setup)"
-      echo "AUTH_USE_AUTH=false"
-      echo "LLM_OPENAI_API_KEY=${honcho_key}"
-      if [ -n "$honcho_base_url" ]; then
-        echo ""
-        echo "# Generative models routed to an OpenAI-compatible provider (e.g. OpenRouter)."
-        local feat
-        for feat in DERIVER SUMMARY DREAM; do
-          echo "${feat}_MODEL_CONFIG__TRANSPORT=openai"
-          [ -n "$honcho_model" ] && echo "${feat}_MODEL_CONFIG__MODEL=${honcho_model}"
-          echo "${feat}_MODEL_CONFIG__OVERRIDES__BASE_URL=${honcho_base_url}"
-        done
-        # Dialectic uses PER-LEVEL model configs; a top-level DIALECTIC_MODEL_CONFIG is IGNORED.
-        # Point every reasoning level at the provider so memory queries don't 401 against OpenAI.
-        local dlvl
-        for dlvl in minimal low medium high max; do
-          echo "DIALECTIC_LEVELS__${dlvl}__MODEL_CONFIG__TRANSPORT=openai"
-          echo "DIALECTIC_LEVELS__${dlvl}__MODEL_CONFIG__MODEL=${honcho_dialectic_model}"
-          echo "DIALECTIC_LEVELS__${dlvl}__MODEL_CONFIG__OVERRIDES__BASE_URL=${honcho_base_url}"
-        done
-      fi
-      if [ -n "$honcho_embed_base" ]; then
-        echo ""
-        echo "# Embeddings via the same OpenAI-compatible provider (OpenRouter serves /v1/embeddings)."
-        echo "# text-embedding-3-small = 1536 dims = Honcho's default schema (no rebuild). DIMENSIONS_MODE"
-        echo "# =never: OpenRouter's embeddings endpoint does not accept a dimensions= param."
-        echo "EMBEDDING_MODEL_CONFIG__TRANSPORT=openai"
-        echo "EMBEDDING_MODEL_CONFIG__MODEL=${honcho_embed_model}"
-        echo "EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL=${honcho_embed_base}"
-        echo "EMBEDDING_MODEL_CONFIG__DIMENSIONS_MODE=never"
-      else
-        echo "# No base_url set: generation + embeddings default to OpenAI and need LLM_OPENAI_API_KEY"
-        echo "# to be a real OpenAI key. To use OpenRouter for both, re-run with HONCHO_LLM_BASE_URL"
-        echo "# (e.g. https://openrouter.ai/api/v1) + HONCHO_LLM_MODEL set."
-      fi
-    } >"$HONCHO_DIR/.env"
-    chmod 600 "$HONCHO_DIR/.env"
-  fi
-  if [ -z "$honcho_key" ]; then
-    echo "[stage] WARN: no HONCHO_LLM_OPENAI_API_KEY/OPENAI_API_KEY set."
-    echo "        Honcho's API will not start until you add LLM_OPENAI_API_KEY to $HONCHO_DIR/.env"
-    echo "        and run: docker compose -f $HONCHO_DIR/docker-compose.yml up -d"
-  fi
-
-  # First build compiles from source — expect several minutes on a Pi 5.
-  echo "[stage] Building + starting Honcho stack (this takes a while on first run)"
-  (cd "$HONCHO_DIR" && docker compose up -d --build) \
-    || { echo "ERROR: Honcho docker compose failed"; exit 1; }
-
-  # Non-fatal readiness probe. Hit /health, not / — Honcho has no route at root
-  # (it 404s), so a `curl -f /` would report a false negative while the API is up.
-  for _ in $(seq 1 30); do
-    curl -fsS -o /dev/null http://127.0.0.1:8000/health 2>/dev/null && { echo "[stage] Honcho API is up on 127.0.0.1:8000"; return 0; }
-    sleep 2
-  done
-  echo "[stage] WARN: Honcho API not responding yet on 127.0.0.1:8000 (check: docker compose -f $HONCHO_DIR/docker-compose.yml logs)"
-}
-
-# ----------------------------------------------------------
 # Stage 1c: Hermes agent — same order intern-server uses internally when it
 # switches a device to Hermes: install binary → register systemd unit → stop
 # OpenClaw → write config.yaml → write .env → enable + start gateway →
@@ -929,8 +809,8 @@ stage_hermes() {
   # printf (not `yes`) keeps the pipe's exit status the command's under pipefail.
   printf 'y\ny\ny\ny\ny\n' | hermes gateway install --system --force --run-as-user root
 
-  # Resource guardrail (ours, not from the docs): the Pi shares RAM with the
-  # Honcho docker stack; mirrors the old openclaw.service cap.
+  # Resource guardrail (ours, not from the docs): keep the gateway from ballooning on a
+  # RAM-constrained Pi; mirrors the old openclaw.service cap.
   mkdir -p /etc/systemd/system/hermes-gateway.service.d
   cat >/etc/systemd/system/hermes-gateway.service.d/override.conf <<'EOF'
 [Service]
@@ -963,12 +843,8 @@ EOF
     llm_model=$(jq -r '.llm_model // empty' "$DEVICE_CONFIG")
     llm_base_url=$(jq -r '.llm_base_url // empty' "$DEVICE_CONFIG")
   fi
-  # OpenRouter key for the unpaired path: explicit OPENROUTER_API_KEY, else reuse the
-  # Honcho OpenRouter key so one key configures both Honcho and Hermes ("one fell swoop").
+  # OpenRouter key for the unpaired (bring-your-own) path.
   local or_key="$OPENROUTER_API_KEY"
-  if [ -z "$or_key" ] && printf '%s' "${HONCHO_LLM_BASE_URL:-}" | grep -qi openrouter; then
-    or_key="${HONCHO_LLM_OPENAI_API_KEY:-}"
-  fi
   if [ -n "$llm_key" ] && [ -n "$llm_model" ] && [ -n "$llm_base_url" ]; then
     have_llm=1
     # Paired device: Autonomous proxy (Anthropic Messages). intern-server's sync loop
@@ -990,7 +866,11 @@ providers:
       claude-haiku-4-5:
         context_length: 200000
 memory:
-  provider: honcho
+  # Hermes' built-in memory: the agent keeps a ~2k MEMORY.md plus the Skills /
+  # Procedural Memory it writes itself. No external provider — Honcho was a fragile,
+  # RAM-hungry over-complication, and the Hermes maintainers run exactly this default.
+  memory_enabled: true
+  user_profile_enabled: true
 YAML
   elif [ -n "$or_key" ]; then
     have_llm=1
@@ -1010,7 +890,11 @@ YAML
     } >"$HERMES_HOME_DIR/config.yaml"
     cat >>"$HERMES_HOME_DIR/config.yaml" <<YAML
 memory:
-  provider: honcho
+  # Hermes' built-in memory: the agent keeps a ~2k MEMORY.md plus the Skills /
+  # Procedural Memory it writes itself. No external provider — Honcho was a fragile,
+  # RAM-hungry over-complication, and the Hermes maintainers run exactly this default.
+  memory_enabled: true
+  user_profile_enabled: true
 # Pin every auxiliary task (vision, compression, title-gen, …) to OpenRouter. Hermes' auxiliary
 # "auto" resolver otherwise walks a hardcoded chain [openrouter, nous, …] and probes Nous'
 # inference-api as a fallback — which 402s without Nous credits and spams the log. An explicit
@@ -1035,11 +919,15 @@ YAML
       echo "[stage] Hermes LLM: OpenRouter configured — no default model pinned (pick one in the dashboard)"
     fi
   else
-    echo "[stage] WARN: no Autonomous pairing and no OpenRouter key (OPENROUTER_API_KEY / Honcho OpenRouter)."
+    echo "[stage] WARN: no Autonomous pairing and no OpenRouter key (set OPENROUTER_API_KEY)."
     echo "        Writing memory-only config.yaml; set a provider in the dashboard or re-run with a key."
     cat >"$HERMES_HOME_DIR/config.yaml" <<'YAML'
 memory:
-  provider: honcho
+  # Hermes' built-in memory: the agent keeps a ~2k MEMORY.md plus the Skills /
+  # Procedural Memory it writes itself. No external provider — Honcho was a fragile,
+  # RAM-hungry over-complication, and the Hermes maintainers run exactly this default.
+  memory_enabled: true
+  user_profile_enabled: true
 YAML
   fi
 
@@ -1090,26 +978,6 @@ hooks:
       timeout: 5
 YAML
   chmod 600 "$HERMES_HOME_DIR/config.yaml"
-
-  # Self-hosted Honcho: baseUrl instead of apiKey (AUTH_USE_AUTH=false on the
-  # server, which only listens on loopback). If you enable auth on Honcho later,
-  # add hosts.hermes.apiKey with a JWT signed by the server's AUTH_JWT_SECRET.
-  if [ ! -f "$HERMES_HOME_DIR/honcho.json" ]; then
-    cat >"$HERMES_HOME_DIR/honcho.json" <<'EOF'
-{
-  "baseUrl": "http://127.0.0.1:8000",
-  "hosts": {
-    "hermes": {
-      "enabled": true,
-      "aiPeer": "hermes",
-      "peerName": "owner",
-      "workspace": "intern"
-    }
-  }
-}
-EOF
-    chmod 600 "$HERMES_HOME_DIR/honcho.json"
-  fi
 
   # --- 5. .env: channel adapter tokens from the device config. Only set keys
   # whose values exist — adapters with missing env vars are simply not
@@ -2175,7 +2043,6 @@ stage_ota_metadata
 stage_gateway_shim   # before backend: up when intern-server first dials :18789
 stage_backend
 stage_tailscale      # before AP switch: needs internet to join the tailnet
-stage_honcho         # before hermes: hermes points its memory provider here
 stage_hermes
 stage_hermes_dashboard   # before caddy: writes /etc/intern-dashboard-url for the wizard redirect
 stage_caddy
@@ -2247,7 +2114,7 @@ fi
 HERMES_DEFAULT_MODEL=$(sed -n "s/^[[:space:]]*default:[[:space:]]*//p" "$HERMES_HOME_DIR/config.yaml" 2>/dev/null | head -1 | tr -d "'\"" )
 echo "Agent:      hermes $HERMES_BRANCH (active_agent in $DEVICE_CONFIG); model: ${HERMES_DEFAULT_MODEL:-none — set in dashboard}"
 echo "Backends:   systemctl status bootstrap intern hermes-gateway intern-gateway-shim"
-echo "Memory:     Honcho at 127.0.0.1:8000 (docker compose -f $HONCHO_DIR/docker-compose.yml logs)"
+echo "Memory:     Hermes built-in (MEMORY.md + skills/procedural) — no external store"
 echo "Updates:    software-update <intern|bootstrap|web|hermes>"
 if [ -z "${TS_AUTHKEY:-}" ]; then
   echo "TODO:       tailscale up --hostname=$TS_NAME && tailscale serve --bg --https=443 http://127.0.0.1:9080"
