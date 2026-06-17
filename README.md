@@ -8,6 +8,8 @@ This script bootstraps a fresh Debian Trixie install with **Hermes** (Nous Resea
 
 One script, `setup`, provisions the whole stack. It's idempotent enough to re-run, and auto-detects whether to run Wi-Fi onboarding (captive-portal access point) or keep an existing connection.
 
+It's a reworked version of the stock [`setup.sh`](https://cdn.autonomous.ai/intern/setup.sh) Autonomous ships (their [quick start](https://docs.autonomous.ai/intern/setup-intern/quick-start) and the [autonomous-intern](https://github.com/autonomous-ai/autonomous-intern) repo cover the stock path). The main swaps are OpenClaw for Hermes and nginx for Caddy.
+
 ## What it installs
 
 | Component | Role |
@@ -27,18 +29,16 @@ One script, `setup`, provisions the whole stack. It's idempotent enough to re-ru
 
 Hermes brings its own memory, and it's simple. The agent keeps a ~2k `MEMORY.md` current and writes its own skills and procedural memory as it works. There's no vector database and no Docker stack to run.
 
-This used to run [Honcho](https://github.com/plastic-labs/honcho) as a self-hosted memory backend. It got ripped out. It was fragile and ate RAM for almost no payoff. The Hermes maintainers run the same default: asked what memory system he uses, Teknium said "I use just the default memory!", meaning the 2k file plus the procedural memory it creates on its own.
-
 ## Requirements
 
 - **Raspberry Pi 5** with Raspberry Pi OS **Trixie** (Debian 13), 64-bit, on an SD card.
 - Internet during setup (Ethernet, a pre-baked Wi-Fi, or onboard via the captive portal).
 - Run as **root**.
-- An **OpenRouter** (or other OpenAI-compatible) API key for the LLM. A **Tailscale** auth key is optional, for unattended tailnet join.
+- An **OpenRouter** (or other OpenAI-compatible) API key for the LLM. A **Tailscale** auth key is optional.
 
 ## Usage
 
-On a fresh Pi 5 (Trixie, with internet), as root:
+On a fresh Pi 5, as root:
 
 ```sh
 OPENROUTER_API_KEY=sk-or-... \
@@ -78,20 +78,20 @@ With the firewall on, SSH the Pi over the tailnet (`ssh <user>@<tailnet-ip>`). L
 
 ## Notes and gotchas (baked into the script)
 
-- **Trixie** uses NetworkManager. `wlan0` is marked unmanaged just before the AP switch (`eth0` stays NM-managed), and the AP/STA scripts use `nmcli`, not `systemctl stop NetworkManager`.
-- Pi 5 has **no RTC**, so the script waits for NTP sync before any TLS download.
-- `intern-server` needs the **SPI0 bus** (`/dev/spidev0.0`) to boot. `stage_enable_spi` turns it on at runtime and in `config.txt`, so the backend comes up without a reboot. The bus exists on every Pi 5, so an LED ring being physically absent doesn't matter.
-- The **dashboard** is tailnet-only via `tailscale serve :443`, Caddy `:9080`, then `:9119`. Caddy rewrites Host, Origin, and X-Forwarded-Proto to satisfy the dashboard's anti-DNS-rebinding guard, including the chat/events WebSocket. Standard port 443 (not :8443) matters, because iCloud Private Relay only relays 80/443, so a non-standard port trips up iOS Safari.
-- The **firewall** (`stage_firewall`, on unless `SKIP_FIREWALL=1`) locks `22/80/443/5000/8080` to loopback, `tailscale0`, and the AP subnet, so SSH and the backends are tailnet-only. It does not enable Tailscale SSH (that needs a tailnet ACL `ssh` rule and would lock out a firewalled device), so use the regular sshd over the tailnet.
-- **Hermes auxiliary tasks** are pinned to OpenRouter so Hermes never probes its hardcoded Nous inference fallback (which 402s without Nous credits).
-- **Rabbit R1** (`stage_r1_shim`): the [`r1_shim`][r1-shim] adapter is not an upstream Hermes feature. The script copies it in and `git apply`s a version-pinned patch to the Hermes checkout. Those are working-tree edits, so a `hermes update` wipes them. Re-run this script to re-apply. The shim runs on `:18790` (the `:18789` stub serves `intern-server`). A fixed token keeps the pairing QR stable across reboots. `intern-r1-qr.service` regenerates it on each gateway start and it shows as a 🐰 tile in the dashboard. Set `R1_SHIM_ENABLED=0` to skip the channel.
-- **Hermes v0.16.0** quirks the script handles: `gateway install` prompts twice (fed `y`), and `dashboard` dropped `--tui` (so it uses `--skip-build` to serve the prebuilt web dist).
-- `hermes update` is broken out of the box (stale single-branch pin). Bump versions by fetching the tag explicitly (`git -C /usr/local/lib/hermes-agent fetch origin 'refs/tags/<tag>:refs/tags/<tag>'`), then re-run the installer (or bump `HERMES_BRANCH` and re-run this script).
+- **Trixie / NetworkManager.** `wlan0` is set unmanaged just before the AP switch (`eth0` stays managed); the AP/STA scripts use `nmcli`.
+- **No RTC.** The script waits for NTP sync before any TLS download.
+- **SPI0.** `intern-server` won't boot without `/dev/spidev0.0`. `stage_enable_spi` enables it at runtime and in `config.txt`, so the backend comes up without a reboot. The bus is there on every Pi 5, with or without the LED ring.
+- **Dashboard is tailnet-only** via `tailscale serve :443` → Caddy `:9080` → `:9119`. Caddy rewrites Host/Origin/X-Forwarded-Proto for the dashboard's anti-DNS-rebinding guard. Port 443, not :8443, is deliberate: iCloud Private Relay only relays 80/443.
+- **Firewall** (`stage_firewall`, on unless `SKIP_FIREWALL=1`) locks `22/80/443/5000/8080` to loopback, `tailscale0`, and the AP subnet. It doesn't turn on Tailscale SSH, so use the regular sshd over the tailnet.
+- **Auxiliary tasks pinned to OpenRouter** so Hermes never probes its Nous inference fallback, which 402s without Nous credits.
+- **Rabbit R1** (`stage_r1_shim`) is a third-party [`r1_shim`][r1-shim], not upstream Hermes. The script patches it into the Hermes checkout, so a `hermes update` wipes it; re-run to re-apply. Runs on `:18790`. A fixed token keeps the pairing QR stable, shown as a 🐰 tile. `R1_SHIM_ENABLED=0` skips it.
+- **`hermes update` is broken** out of the box (stale single-branch pin). Bump `HERMES_BRANCH` and re-run, or fetch the tag by hand.
 
 The inline comments in `setup` carry the full rationale for each stage.
 
 ## Credits
 
+- [autonomous-intern](https://github.com/autonomous-ai/autonomous-intern) and the stock [`setup.sh`](https://cdn.autonomous.ai/intern/setup.sh), Autonomous. This is a rework of that.
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent), Nous Research
 - [r1-hermes-shim][r1-shim], the Rabbit R1 channel
 
