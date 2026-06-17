@@ -1715,8 +1715,17 @@ iptables -A INTERN-LOCK -p tcp -m multiport --dports "$LOCKED_PORTS" -j DROP
 iptables -C INPUT -j INTERN-LOCK 2>/dev/null || iptables -I INPUT 1 -j INTERN-LOCK
 echo "intern-firewall: $LOCKED_PORTS tailnet-only${LAN_SSH_CIDR:+; SSH also from $LAN_SSH_CIDR}"
 EOF
-  # Inject the operator's choice (empty = tailnet-only, "auto", or an explicit CIDR).
-  sed -i "s|__LAN_SSH_CIDR__|${LAN_SSH_CIDR:-}|" /usr/local/bin/intern-firewall
+  # Resolve "auto" to a concrete LAN /24 NOW (network is up) and bake that in. The firewall
+  # service runs Before=network.target, where the firewall's own runtime auto-detection would
+  # find no default route and silently drop the LAN-SSH allow on every boot.
+  local lan_ssh="${LAN_SSH_CIDR:-}"
+  if [ "$lan_ssh" = "auto" ]; then
+    local _lif; _lif="$(ip route show default 2>/dev/null | awk '{print $5; exit}')"
+    lan_ssh="$(ip -4 -o addr show "$_lif" 2>/dev/null | awk '{print $4; exit}' | sed -E 's#\.[0-9]+/[0-9]+#.0/24#')"
+    [ -n "$lan_ssh" ] && echo "[stage] LAN_SSH_CIDR=auto -> $lan_ssh" \
+      || echo "[stage] WARN: LAN_SSH_CIDR=auto couldn't detect a LAN subnet; SSH stays tailnet-only"
+  fi
+  sed -i "s|__LAN_SSH_CIDR__|${lan_ssh}|" /usr/local/bin/intern-firewall
   chmod +x /usr/local/bin/intern-firewall
 
   cat >/etc/systemd/system/intern-firewall.service <<'EOF'
