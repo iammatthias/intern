@@ -1736,8 +1736,11 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable intern-firewall.service
-  /usr/local/bin/intern-firewall
+  # enable --now both runs the oneshot (which applies the rules via ExecStart) AND marks the
+  # service active(exited), so `systemctl is-active intern-firewall` reflects reality. Running
+  # the binary directly + only enabling left the service "inactive" until the next boot even
+  # though the rules were applied. Idempotent: the chain is rebuilt on each run.
+  systemctl enable --now intern-firewall.service
   echo "[stage] NOTE: new LAN connections to 22/80 are now dropped; use the tailnet (or the AP) instead."
 }
 
