@@ -1,11 +1,11 @@
-# pi-ntern
+# intern
 
 Turn a fresh **Raspberry Pi 5** (Raspberry Pi OS **Trixie**, 64-bit, on an SD card) into an
 "Autonomous Intern" running the **Hermes** agent (Nous Research) with a self-hosted **Honcho**
 memory backend, a **Caddy** web layer, **Tailscale** for secure remote access, and an optional
 **Rabbit R1** channel.
 
-One script, `setup-hermes.sh`, provisions the whole stack. It's idempotent enough to re-run, and
+One script, `setup`, provisions the whole stack. It's idempotent enough to re-run, and
 auto-detects whether to run Wi-Fi onboarding (captive-portal access point) or keep an existing
 connection.
 
@@ -40,7 +40,7 @@ On a fresh Pi 5 (Trixie, with internet), as root:
 OPENROUTER_API_KEY=sk-or-... \
 HONCHO_LLM_OPENAI_API_KEY=sk-or-... HONCHO_LLM_BASE_URL=https://openrouter.ai/api/v1 HONCHO_LLM_MODEL=openrouter/auto \
 TS_AUTHKEY=tskey-... \
-  sudo -E bash setup-hermes.sh
+  sudo -E bash setup
 ```
 
 A desk/dev box you reach over Wi-Fi (keeps `wlan0` + SSH up, no AP switch, no firewall, no reboot):
@@ -50,7 +50,7 @@ SKIP_FIREWALL=1 SKIP_REBOOT=1 \
 OPENROUTER_API_KEY=sk-or-... \
 HONCHO_LLM_OPENAI_API_KEY=sk-or-... HONCHO_LLM_BASE_URL=https://openrouter.ai/api/v1 HONCHO_LLM_MODEL=openrouter/auto \
 TS_AUTHKEY=tskey-... \
-  sudo -E bash setup-hermes.sh
+  sudo -E bash setup
 ```
 
 > One OpenRouter key configures both Hermes and Honcho — `OPENROUTER_API_KEY` is reused for Honcho
@@ -116,7 +116,7 @@ locked.
   the tag explicitly (`git -C /usr/local/lib/hermes-agent fetch origin 'refs/tags/<tag>:refs/tags/<tag>'`)
   then re-running the installer (or bump `HERMES_BRANCH` and re-run this script).
 
-The inline comments in `setup-hermes.sh` carry the full rationale for each stage.
+The inline comments in `setup` carry the full rationale for each stage.
 
 ## Credits
 

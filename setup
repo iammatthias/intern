@@ -1,5 +1,5 @@
 #!/bin/bash
-# pi-ntern — turn a fresh Raspberry Pi 5 (Raspberry Pi OS Trixie, SD card) into an
+# intern — turn a fresh Raspberry Pi 5 (Raspberry Pi OS Trixie, SD card) into an
 # "Autonomous Intern" running the Hermes agent (Nous Research). Provisions, in order:
 #   - Caddy            setup web UI + API proxy (Cloudsmith apt repo)
 #   - intern backend   the Autonomous intern-server (LED ring, Wi-Fi onboarding API)
@@ -785,7 +785,7 @@ stage_honcho() {
   local honcho_dialectic_model="${HONCHO_DIALECTIC_MODEL:-google/gemini-2.5-flash}"
   if [ ! -f "$HONCHO_DIR/.env" ]; then
     {
-      echo "# Honcho self-hosted config (written by setup-hermes.sh)"
+      echo "# Honcho self-hosted config (written by setup)"
       echo "AUTH_USE_AUTH=false"
       echo "LLM_OPENAI_API_KEY=${honcho_key}"
       if [ -n "$honcho_base_url" ]; then
@@ -1620,7 +1620,7 @@ R1JS
 # intern-dashboard-r1-patch — idempotently inject the R1 pairing tile script into
 # the Hermes dashboard SPA's index.html. Re-runnable; a no-op if already patched.
 #
-# The dashboard dist is replaced on `hermes` reinstall/update, so setup-hermes.sh
+# The dashboard dist is replaced on `hermes` reinstall/update, so setup
 # re-applies this after any Hermes (re)install. A plain reboot keeps the patch.
 set -euo pipefail
 
