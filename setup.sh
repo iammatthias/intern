@@ -16,7 +16,9 @@
 # Optional env:
 #   TS_AUTHKEY              Tailscale auth key for unattended join (else: run `tailscale up` later)
 #   TS_HOSTNAME             Tailnet hostname (default: intern-<serial suffix>)
-#   HERMES_BRANCH           Hermes installer release tag (default: v2026.6.5 == v0.16.0)
+#   HERMES_BRANCH           Branch/tag the installer clones (default: main)
+#   HERMES_REF              Commit to pin after clone (default: a main commit with the #48507
+#                           batch-memory feature; set "" to track HERMES_BRANCH HEAD)
 #   OPENROUTER_API_KEY      Hermes LLM key for the unpaired/BYO path
 #   HERMES_MODEL            Optionally pin the default chat model (default: unset — pick it in
 #                           the dashboard). HERMES_FALLBACK_MODEL adds an explicit fallback.
@@ -83,11 +85,13 @@ AP_CHANNEL="${AP_CHANNEL:-}"    # default: 6 (2.4 GHz) or 36 (5 GHz); override e
 
 WEB_ROOT="/usr/share/caddy/setup"
 HERMES_HOME_DIR="/root/.hermes"
-# Pinned Hermes release tag (== v0.16.0). Bump to track upstream; the installer's
-# `--branch` accepts tags. NB: the device-runtime doc pins v2026.4.30, but that ref
-# is stale (it 404s on `hermes update`, which looks for a *branch* of that name) and
-# several releases behind — we track the current tag instead.
-HERMES_BRANCH="${HERMES_BRANCH:-v2026.6.5}"
+# Hermes source pin. The installer clones HERMES_BRANCH (its `--branch` accepts a tag or a
+# branch), then we check out HERMES_REF for reproducibility. Right now we track `main` pinned
+# to a commit because the default-memory batch-ops feature (PR #48507) is merged but not in a
+# tagged release yet. Once Nous tags a release that contains it, set HERMES_BRANCH=v<tag> and
+# HERMES_REF="" to go back to a clean tag. (The last tag, v2026.6.5 == v0.16.0, predates #48507.)
+HERMES_BRANCH="${HERMES_BRANCH:-main}"
+HERMES_REF="${HERMES_REF:-d2c53ff5583eca0e5f4009a3fcc28c5da8b17fce}"
 # Pairing-time device config (LLM key/model/base_url, channel tokens, active_agent)
 DEVICE_CONFIG="/root/config/config.json"
 # Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own OpenRouter.
@@ -757,20 +761,20 @@ apply_r1_shim_patches() {
     return 0
   fi
 
-  # 2. version-pinned source patch (config.py enum+env, run.py dispatch+auth bypass)
-  local patch=/tmp/r1-shim-hermes.patch
+  # 2. source patch via the anchor-based porter. The old version-pinned unified diff
+  #    (patches/hermes-<tag>.patch) stopped applying after upstream moved gateway internals
+  #    (e.g. the auth-bypass set went from run.py to gateway/authz_mixin.py). r1-port.py anchors
+  #    on stable strings (Platform enum, _apply_env_overrides, adapter dispatch, authz set)
+  #    instead of line context, and is idempotent — safe to re-run on every provision.
+  local porter=/tmp/r1-port.py
   if ! curl -fsSL --retry 3 --retry-delay 3 "${auth[@]}" \
-       "$R1_SHIM_REPO_RAW/patches/hermes-${HERMES_BRANCH}.patch" -o "$patch"; then
-    echo "[stage] WARN: no r1_shim patch for Hermes $HERMES_BRANCH at $R1_SHIM_REPO_RAW — skipping (inert)"
+       "$R1_SHIM_REPO_RAW/r1-port.py" -o "$porter"; then
+    echo "[stage] WARN: could not fetch r1-port.py from $R1_SHIM_REPO_RAW — R1 source left unpatched (inert)"
     return 0
   fi
-  if git -C "$src" apply --reverse --check "$patch" 2>/dev/null; then
-    echo "[stage] r1_shim source patch already applied"
-  elif git -C "$src" apply --check "$patch" 2>/dev/null; then
-    git -C "$src" apply "$patch" && echo "[stage] r1_shim source patch applied to $src"
-  else
-    echo "[stage] WARN: r1_shim patch does not apply to Hermes $HERMES_BRANCH — source left unmodified (R1 inert)."
-    echo "        The patch is pinned to a Hermes tag; regenerate patches/hermes-<tag>.patch if you changed HERMES_BRANCH."
+  if ! python3 "$porter" "$src"; then
+    echo "[stage] WARN: r1-port.py failed (a source anchor moved?) — R1 source left unpatched (inert)."
+    echo "        Update the anchors in r1-port.py in the r1-hermes-shim repo for the current Hermes."
     return 0
   fi
 
@@ -780,7 +784,7 @@ apply_r1_shim_patches() {
 }
 
 stage_hermes() {
-  echo "[stage] Install Hermes agent (pinned tag: $HERMES_BRANCH)"
+  echo "[stage] Install Hermes agent (branch $HERMES_BRANCH${HERMES_REF:+, pinned to ${HERMES_REF:0:12})}"
   export HOME=/root
 
   # --- 1. Install the Hermes binary.
@@ -819,9 +823,26 @@ LimitNOFILE=65535
 EOF
   systemctl daemon-reload
 
+  # --- 2a. Pin to a fixed commit. We cloned a branch (main) above; check out HERMES_REF so the
+  # install is reproducible. Hermes is an EDITABLE install (the venv imports straight from the
+  # checkout), so a checkout + `pip install -e --no-deps` (regenerates the editable finder for
+  # the new package layout) swaps the running code with NO dependency reinstall — the Python deps
+  # didn't change across this range. Done AFTER `hermes gateway install` (which re-checks-out the
+  # cloned branch) and BEFORE the R1 patch below (which edits the working tree).
+  if [ -n "${HERMES_REF:-}" ]; then
+    local hlib=/usr/local/lib/hermes-agent
+    if git -C "$hlib" fetch --depth 1 origin "$HERMES_REF" \
+       && git -C "$hlib" checkout -f "$HERMES_REF" \
+       && "$hlib/venv/bin/pip" install -e "$hlib" --no-deps -q; then
+      echo "[stage] Hermes pinned to commit $(git -C "$hlib" rev-parse --short HEAD)"
+    else
+      echo "[stage] WARN: could not pin Hermes to $HERMES_REF — staying on branch $HERMES_BRANCH HEAD"
+    fi
+  fi
+
   # --- 2b. R1 channel (third-party shim): copy the adapter + patch the Hermes source NOW, before
   # the gateway starts below, so R1_SHIM is a known Platform when the .env (step 5) enables it.
-  # Idempotent; re-applied here because `hermes gateway install` re-checks-out the pinned tag.
+  # Idempotent; re-applied here because the pin checkout above resets the working tree.
   if [ "${R1_SHIM_ENABLED}" = "1" ]; then
     apply_r1_shim_patches
   fi

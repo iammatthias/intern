@@ -16,7 +16,7 @@ It's a reworked version of the stock [`setup.sh`](https://cdn.autonomous.ai/inte
 |-----------|------|
 | **Caddy** | Serves the setup web UI on `:80`, reverse-proxies `/api/*` to `intern-server:5000`, plus a loopback `:9080` Host/Origin-rewrite hop for the dashboard |
 | **intern backend** | The Autonomous `intern-server` (LED ring on SPI0, Wi-Fi onboarding API) |
-| **Hermes agent** | Gateway as a systemd service (`hermes-gateway`), pinned to a release tag (default `v2026.6.5`, == v0.16.0) |
+| **Hermes agent** | Gateway as a systemd service (`hermes-gateway`), pinned to a fixed upstream commit (currently a `main` commit, for the batch-memory work that isn't in a release tag yet) |
 | **Memory** | Hermes' built-in store: a ~2k `MEMORY.md` plus the skills and procedural memory it writes itself. No vector DB, no Docker. See [Memory](#memory) |
 | **Tailscale** | SSH over the tailnet (regular sshd, key auth), and the Hermes dashboard published tailnet-only on standard HTTPS `:443` |
 | **Hermes dashboard** | Web UI for config, API keys, and chat (`hermes-dashboard`, loopback `:9119`) |
@@ -28,6 +28,8 @@ It's a reworked version of the stock [`setup.sh`](https://cdn.autonomous.ai/inte
 ## Memory
 
 Hermes brings its own memory, and it's simple. The agent keeps a ~2k `MEMORY.md` current and writes its own skills and procedural memory as it works. There's no vector database and no Docker stack to run.
+
+The pinned build also lets the agent batch its edits: it can add, replace, and remove memory entries in one atomic call, so it spends far fewer turns keeping the file under budget.
 
 ## Requirements
 
@@ -62,7 +64,7 @@ TS_AUTHKEY=tskey-... \
 | `TS_AUTHKEY` / `TS_HOSTNAME` | Tailscale unattended join and tailnet hostname (default `intern-<serial>`) |
 | `OPENROUTER_API_KEY` | LLM key for Hermes on the unpaired (bring-your-own) path |
 | `HERMES_MODEL` / `HERMES_FALLBACK_MODEL` | optional. Pin a chat model. Default is unset, so you pick it in the dashboard |
-| `HERMES_BRANCH` | Hermes release tag (default `v2026.6.5`) |
+| `HERMES_BRANCH` / `HERMES_REF` | Branch the installer clones (default `main`) and the commit it pins to (default: a `main` commit with the batch-memory feature). Set `HERMES_REF` empty to track the branch HEAD |
 | `R1_SHIM_ENABLED` / `R1_SHIM_TOKEN` / `R1_SHIM_PORT` | Rabbit R1 channel: on by default, token auto-generated (fixed), port `18790` |
 | `R1_SHIM_REPO_RAW` | Source of the `r1_shim` adapter and Hermes patch ([iammatthias/r1-hermes-shim][r1-shim]) |
 | `AP_MODE` | `auto` (default), `force`, or `skip`. Captive-portal onboarding vs. use existing Wi-Fi |
@@ -85,7 +87,7 @@ With the firewall on, SSH the Pi over the tailnet (`ssh <user>@<tailnet-ip>`). L
 - **Firewall** (`stage_firewall`, on unless `SKIP_FIREWALL=1`) locks `22/80/443/5000/8080` to loopback, `tailscale0`, and the AP subnet. It doesn't turn on Tailscale SSH, so use the regular sshd over the tailnet.
 - **Auxiliary tasks pinned to OpenRouter** so Hermes never probes its Nous inference fallback, which 402s without Nous credits.
 - **Rabbit R1** (`stage_r1_shim`) is a third-party [`r1_shim`][r1-shim], not upstream Hermes. The script patches it into the Hermes checkout, so a `hermes update` wipes it; re-run to re-apply. Runs on `:18790`. A fixed token keeps the pairing QR stable, shown as a 🐰 tile. `R1_SHIM_ENABLED=0` skips it.
-- **`hermes update` is broken** out of the box (stale single-branch pin). Bump `HERMES_BRANCH` and re-run, or fetch the tag by hand.
+- **`hermes update` is broken** out of the box (stale single-branch pin). Bump `HERMES_BRANCH`/`HERMES_REF` and re-run, or check out the ref by hand. Hermes is an editable install, so a `git checkout` plus a gateway restart swaps the running code when no dependencies changed.
 
 The inline comments in `setup` carry the full rationale for each stage.
 
