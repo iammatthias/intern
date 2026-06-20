@@ -86,12 +86,13 @@ AP_CHANNEL="${AP_CHANNEL:-}"    # default: 6 (2.4 GHz) or 36 (5 GHz); override e
 WEB_ROOT="/usr/share/caddy/setup"
 HERMES_HOME_DIR="/root/.hermes"
 # Hermes source pin. The installer clones HERMES_BRANCH (its `--branch` accepts a tag or a
-# branch), then we check out HERMES_REF for reproducibility. Right now we track `main` pinned
-# to a commit because the default-memory batch-ops feature (PR #48507) is merged but not in a
-# tagged release yet. Once Nous tags a release that contains it, set HERMES_BRANCH=v<tag> and
-# HERMES_REF="" to go back to a clean tag. (The last tag, v2026.6.5 == v0.16.0, predates #48507.)
-HERMES_BRANCH="${HERMES_BRANCH:-main}"
-HERMES_REF="${HERMES_REF:-d2c53ff5583eca0e5f4009a3fcc28c5da8b17fce}"
+# branch); HERMES_REF optionally checks out a commit afterward for reproducibility. We pin a
+# clean tag: v2026.6.19 == v0.17.0, the first tagged release that contains the default-memory
+# batch-ops feature (PR #48507 — atomic add/replace/remove in one `memory` call). We previously
+# tracked `main` at commit d2c53ff to get #48507 before it was tagged; 0.17.0 now ships it, so
+# HERMES_REF is empty (track the tag's HEAD). To pin a commit again, set HERMES_REF=<sha>.
+HERMES_BRANCH="${HERMES_BRANCH:-v2026.6.19}"
+HERMES_REF="${HERMES_REF:-}"
 # Pairing-time device config (LLM key/model/base_url, channel tokens, active_agent)
 DEVICE_CONFIG="/root/config/config.json"
 # Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own OpenRouter.
@@ -823,11 +824,13 @@ LimitNOFILE=65535
 EOF
   systemctl daemon-reload
 
-  # --- 2a. Pin to a fixed commit. We cloned a branch (main) above; check out HERMES_REF so the
-  # install is reproducible. Hermes is an EDITABLE install (the venv imports straight from the
-  # checkout), so a checkout + `pip install -e --no-deps` (regenerates the editable finder for
-  # the new package layout) swaps the running code with NO dependency reinstall — the Python deps
-  # didn't change across this range. Done AFTER `hermes gateway install` (which re-checks-out the
+  # --- 2a. Optional commit pin. HERMES_REF is empty by default (we track the HERMES_BRANCH tag's
+  # HEAD), but if set we check it out for byte-for-byte reproducibility — useful to ride a `main`
+  # commit ahead of a tagged release. Hermes is an EDITABLE install (the venv imports straight
+  # from the checkout), so a checkout + `pip install -e --no-deps` (regenerates the editable
+  # finder for the new package layout) swaps the running code without a dependency reinstall, as
+  # long as the Python manifests didn't change vs the cloned branch — check pyproject/uv.lock if
+  # pinning across a wide range. Done AFTER `hermes gateway install` (which re-checks-out the
   # cloned branch) and BEFORE the R1 patch below (which edits the working tree).
   if [ -n "${HERMES_REF:-}" ]; then
     local hlib=/usr/local/lib/hermes-agent
