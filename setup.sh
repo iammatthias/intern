@@ -25,8 +25,8 @@
 #   R1_SHIM_ENABLED         1 (default) | 0 — install the Rabbit R1 channel (third-party shim)
 #   R1_SHIM_TOKEN           Fixed R1 pairing token (default: auto-generated; keeps the QR stable)
 #   R1_SHIM_PORT            R1 shim WebSocket port (default: 18790)
-#   R1_SHIM_REPO_RAW        Raw base URL for the r1_shim adapter + Hermes patch
-#                           (default: github.com/iammatthias/r1-hermes-shim main)
+#   R1_SHIM_REPO            Plugin repo (owner/repo) for `hermes plugins install`
+#                           (default: iammatthias/r1-hermes-shim)
 #   INTERN_SKILLS_ZIP_URL   Onboarding-skill archive URL (best-effort; non-fatal if unreachable).
 #                           GITHUB_TOKEN is sent as a bearer header for a private repo.
 #   INTERN_ONBOARDING_SKILL Skill folder name inside the archive (default: autonomous-intern-onboarding)
@@ -86,13 +86,15 @@ AP_CHANNEL="${AP_CHANNEL:-}"    # default: 6 (2.4 GHz) or 36 (5 GHz); override e
 WEB_ROOT="/usr/share/caddy/setup"
 HERMES_HOME_DIR="/root/.hermes"
 # Hermes source pin. The installer clones HERMES_BRANCH (its `--branch` accepts a tag or a
-# branch); HERMES_REF optionally checks out a commit afterward for reproducibility. We pin a
-# clean tag: v2026.6.19 == v0.17.0, the first tagged release that contains the default-memory
-# batch-ops feature (PR #48507 — atomic add/replace/remove in one `memory` call). We previously
-# tracked `main` at commit d2c53ff to get #48507 before it was tagged; 0.17.0 now ships it, so
-# HERMES_REF is empty (track the tag's HEAD). To pin a commit again, set HERMES_REF=<sha>.
-HERMES_BRANCH="${HERMES_BRANCH:-v2026.6.19}"
-HERMES_REF="${HERMES_REF:-}"
+# branch); HERMES_REF optionally checks out a commit afterward for reproducibility. We track
+# `main` pinned to a commit, because the skills we want (e.g. the /learn skill) are on main
+# ahead of the latest tag (v2026.6.19 == 0.17.0 predates them). Cloning the `main` BRANCH (not a
+# tag) is ALSO what keeps the native `hermes update` working: a `--branch <tag>` clone is
+# single-branch with no origin/main, so `hermes update` can't switch to main; a main clone tracks
+# origin/main. Set HERMES_REF="" to ride main HEAD, bump it to a newer commit, or move to a tag
+# (HERMES_BRANCH=v<tag>, HERMES_REF="") once one ships the skills we're tracking.
+HERMES_BRANCH="${HERMES_BRANCH:-main}"
+HERMES_REF="${HERMES_REF:-f53b184c48712bcbb98556a6314cd1f240fc104d}"
 # Pairing-time device config (LLM key/model/base_url, channel tokens, active_agent)
 DEVICE_CONFIG="/root/config/config.json"
 # Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own OpenRouter.
@@ -107,20 +109,21 @@ HERMES_FALLBACK_MODEL="${HERMES_FALLBACK_MODEL:-}"
 # camera photos via vision_analyze — needs an explicit multimodal model here.
 HERMES_VISION_MODEL="${HERMES_VISION_MODEL:-google/gemini-3-flash-preview}"
 
-# Rabbit R1 channel. r1_shim is a THIRD-PARTY shim (github.com/iammatthias/r1-hermes-shim),
-# NOT an upstream Hermes feature — upstream Hermes does not ship it. stage_hermes installs it
-# by copying the adapter and applying a small source patch (pinned to HERMES_BRANCH) into the
-# Hermes git checkout; `hermes update` would wipe those edits, so the patch step is idempotent
-# and re-run on every provision. It is an OpenClaw-compatible WS gateway and MUST NOT share
-# :18789 with the intern-gateway-shim stub (intern-server needs that one), so it runs on :18790.
-# A fixed token keeps the pairing QR stable across reboots (pair once). The QR is rendered to
-# /usr/share/caddy/r1 and shown as a tile in the Hermes dashboard (stage_r1_shim).
+# Rabbit R1 channel. r1_shim is a THIRD-PARTY Hermes PLATFORM PLUGIN
+# (github.com/iammatthias/r1-hermes-shim), NOT an upstream Hermes feature. stage_hermes installs
+# it with `hermes plugins install` into ~/.hermes/plugins/, so it needs ZERO Hermes source edits
+# and survives `hermes update` (earlier versions patched the source tree and broke on every
+# upgrade). It is an OpenClaw-compatible WS gateway and MUST NOT share :18789 with the
+# intern-gateway-shim stub (intern-server needs that one), so it runs on :18790. A fixed token
+# keeps the pairing QR stable across reboots (pair once) and is what auto-enables the channel via
+# the plugin's env_enablement hook. The QR is rendered to /usr/share/caddy/r1 and shown as a tile
+# in the Hermes dashboard (stage_r1_shim).
 # Set R1_SHIM_ENABLED=0 to skip the channel; leave the token empty to auto-generate one.
 R1_SHIM_ENABLED="${R1_SHIM_ENABLED:-1}"
 R1_SHIM_PORT="${R1_SHIM_PORT:-18790}"
 R1_SHIM_TOKEN="${R1_SHIM_TOKEN:-}"
-# Source of the r1_shim adapter + the version-pinned Hermes patch (raw GitHub; set GITHUB_TOKEN if private).
-R1_SHIM_REPO_RAW="${R1_SHIM_REPO_RAW:-https://raw.githubusercontent.com/iammatthias/r1-hermes-shim/main}"
+# The plugin repo, in `hermes plugins install` owner/repo shorthand (set GITHUB_TOKEN if private).
+R1_SHIM_REPO="${R1_SHIM_REPO:-iammatthias/r1-hermes-shim}"
 
 # AP onboarding mode: auto (default) | force | skip.
 #   auto  — skip the AP/captive-portal step when Wi-Fi is already configured (baked
@@ -735,53 +738,37 @@ stage_tailscale() {
 # onboarding skill → persist active_agent.
 # ----------------------------------------------------------
 
-# Install the THIRD-PARTY r1_shim adapter into the Hermes source tree. Upstream Hermes does NOT
-# ship r1_shim — we copy the adapter and git-apply a small source patch pinned to HERMES_BRANCH
-# (source of truth: github.com/iammatthias/r1-hermes-shim). These are working-tree edits to the
-# Hermes git checkout, so `hermes update`/reinstall wipes them; this runs on every provision and
-# is idempotent (reverse-check). If the patch doesn't apply (Hermes != the pinned tag) it warns
-# and leaves the source untouched (R1 channel inert) rather than corrupting it.
-apply_r1_shim_patches() {
-  local src="" d
-  for d in /usr/local/lib/hermes-agent "$HERMES_HOME_DIR/hermes-agent"; do
-    if [ -f "$d/gateway/config.py" ]; then src="$d"; break; fi
-  done
-  if [ -z "$src" ]; then
-    echo "[stage] WARN: Hermes source not found — cannot install r1_shim adapter (R1 channel inert)"
+# Install the THIRD-PARTY r1_shim channel as a Hermes PLATFORM PLUGIN. Upstream Hermes does NOT
+# ship it (source of truth: github.com/iammatthias/r1-hermes-shim), but it's a self-contained
+# plugin (plugin.yaml + register(ctx)) that Hermes installs into ~/.hermes/plugins/ via its
+# native plugin CLI. That lives OUTSIDE the Hermes git checkout, so it needs ZERO source edits
+# and survives `hermes update` (the old approach patched gateway/config.py + run.py +
+# authz_mixin.py, which `hermes update` stashed/discarded — it broke on every upgrade).
+# Idempotent: clones if absent, otherwise pulls latest. Best-effort/non-fatal.
+install_r1_shim_plugin() {
+  export HOME=/root
+  if ! command -v hermes >/dev/null 2>&1; then
+    echo "[stage] WARN: hermes not on PATH — cannot install R1 plugin (channel inert)"
     return 0
   fi
-
-  local -a auth=()
-  [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
-
-  # 1. adapter file (idempotent overwrite)
-  if ! curl -fsSL --retry 3 --retry-delay 3 "${auth[@]}" \
-       "$R1_SHIM_REPO_RAW/gateway/platforms/r1_shim.py" \
-       -o "$src/gateway/platforms/r1_shim.py"; then
-    echo "[stage] WARN: could not fetch r1_shim.py from $R1_SHIM_REPO_RAW — skipping R1 patch (inert)"
-    return 0
+  # `hermes plugins install <owner/repo>` keys the install dir off plugin.yaml's name (r1-shim).
+  local pdir="$HERMES_HOME_DIR/plugins/r1-shim"
+  if [ -d "$pdir/.git" ]; then
+    echo "[stage] R1 plugin present — pulling latest"
+    HERMES_HOME="$HERMES_HOME_DIR" hermes plugins update r1-shim 2>&1 | tail -2 || true
+  else
+    echo "[stage] Installing R1 channel as a Hermes plugin ($R1_SHIM_REPO)"
+    if ! HERMES_HOME="$HERMES_HOME_DIR" hermes plugins install "$R1_SHIM_REPO" 2>&1 | tail -3; then
+      echo "[stage] WARN: 'hermes plugins install $R1_SHIM_REPO' failed — R1 channel not installed"
+      return 0
+    fi
   fi
-
-  # 2. source patch via the anchor-based porter. The old version-pinned unified diff
-  #    (patches/hermes-<tag>.patch) stopped applying after upstream moved gateway internals
-  #    (e.g. the auth-bypass set went from run.py to gateway/authz_mixin.py). r1-port.py anchors
-  #    on stable strings (Platform enum, _apply_env_overrides, adapter dispatch, authz set)
-  #    instead of line context, and is idempotent — safe to re-run on every provision.
-  local porter=/tmp/r1-port.py
-  if ! curl -fsSL --retry 3 --retry-delay 3 "${auth[@]}" \
-       "$R1_SHIM_REPO_RAW/r1-port.py" -o "$porter"; then
-    echo "[stage] WARN: could not fetch r1-port.py from $R1_SHIM_REPO_RAW — R1 source left unpatched (inert)"
-    return 0
-  fi
-  if ! python3 "$porter" "$src"; then
-    echo "[stage] WARN: r1-port.py failed (a source anchor moved?) — R1 source left unpatched (inert)."
-    echo "        Update the anchors in r1-port.py in the r1-hermes-shim repo for the current Hermes."
-    return 0
-  fi
-
-  # 3. drop stale bytecode so the patched modules are reimported on gateway start
-  find "$src" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
-  echo "[stage] r1_shim adapter installed (port ${R1_SHIM_PORT})"
+  # Platform plugins are allow-listed (untrusted code), so enable it explicitly.
+  HERMES_HOME="$HERMES_HOME_DIR" hermes plugins enable r1-shim 2>&1 | tail -1 \
+    || echo "[stage] WARN: could not enable r1-shim plugin"
+  # Drop stale bytecode so the gateway imports the current adapter.
+  find "$pdir" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+  echo "[stage] R1 plugin ready (r1_shim on :${R1_SHIM_PORT}; survives hermes update)"
 }
 
 stage_hermes() {
@@ -824,16 +811,20 @@ LimitNOFILE=65535
 EOF
   systemctl daemon-reload
 
-  # --- 2a. Optional commit pin. HERMES_REF is empty by default (we track the HERMES_BRANCH tag's
-  # HEAD), but if set we check it out for byte-for-byte reproducibility — useful to ride a `main`
-  # commit ahead of a tagged release. Hermes is an EDITABLE install (the venv imports straight
-  # from the checkout), so a checkout + `pip install -e --no-deps` (regenerates the editable
-  # finder for the new package layout) swaps the running code without a dependency reinstall, as
-  # long as the Python manifests didn't change vs the cloned branch — check pyproject/uv.lock if
-  # pinning across a wide range. Done AFTER `hermes gateway install` (which re-checks-out the
-  # cloned branch) and BEFORE the R1 patch below (which edits the working tree).
+  # --- 2a. Keep `hermes update` working, then optionally pin a commit. The official installer
+  # makes a SINGLE-branch clone, so a `--branch <tag>` install has no origin/main and
+  # `hermes update` can't switch to main (the bug that breaks updates). Normalize the fetch
+  # refspec so origin tracks all branches — idempotent, a no-op for a main clone and the cure for
+  # a tag clone.
+  local hlib=/usr/local/lib/hermes-agent
+  git -C "$hlib" config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*" 2>/dev/null || true
+  # HERMES_REF (a main commit by default) is checked out for byte-for-byte reproducibility. Hermes
+  # is an EDITABLE install (the venv imports straight from the checkout), so checkout +
+  # `pip install -e --no-deps` (regenerates the editable finder) swaps the running code without a
+  # dependency reinstall, as long as the Python manifests didn't change vs the cloned branch.
+  # `hermes update` later re-attaches to HERMES_BRANCH and moves forward. Done AFTER
+  # `hermes gateway install` (which re-checks-out the cloned branch).
   if [ -n "${HERMES_REF:-}" ]; then
-    local hlib=/usr/local/lib/hermes-agent
     if git -C "$hlib" fetch --depth 1 origin "$HERMES_REF" \
        && git -C "$hlib" checkout -f "$HERMES_REF" \
        && "$hlib/venv/bin/pip" install -e "$hlib" --no-deps -q; then
@@ -843,11 +834,12 @@ EOF
     fi
   fi
 
-  # --- 2b. R1 channel (third-party shim): copy the adapter + patch the Hermes source NOW, before
-  # the gateway starts below, so R1_SHIM is a known Platform when the .env (step 5) enables it.
-  # Idempotent; re-applied here because the pin checkout above resets the working tree.
+  # --- 2b. R1 channel: install the third-party r1_shim PLUGIN now, before the gateway starts, so
+  # it registers its platform on the first gateway boot (which is what makes Platform("r1_shim")
+  # valid). It lives in ~/.hermes/plugins/, so neither the pin checkout above nor a later
+  # `hermes update` touches it.
   if [ "${R1_SHIM_ENABLED}" = "1" ]; then
-    apply_r1_shim_patches
+    install_r1_shim_plugin
   fi
 
   # --- 3. Stop OpenClaw. This script never installs it, but the golden image may
@@ -1015,9 +1007,12 @@ YAML
   chmod 600 "$HERMES_HOME_DIR/.env"
   # OpenRouter provider key (unpaired/BYO path) — Hermes only sends it to openrouter.ai.
   [ -n "$or_key" ] && echo "OPENROUTER_API_KEY=${or_key}" >>"$HERMES_HOME_DIR/.env"
-  # Rabbit R1 channel. The adapter + source patch were installed in step 2b; these env vars turn
-  # it on. A fixed token makes the pairing QR stable across reboots; :18790 avoids the
-  # intern-gateway-shim stub on :18789. The gateway reads these on the restart in step 6, so it
+  # Rabbit R1 channel. The plugin was installed in step 2b; these env vars configure + enable it.
+  # R1_SHIM_TOKEN's presence auto-enables the channel (the plugin's env_enablement hook) and a
+  # fixed value keeps the pairing QR stable across reboots; :18790 avoids the intern-gateway-shim
+  # stub on :18789. R1_SHIM_ALLOW_ALL_USERS authorizes the device (it authenticates at the WS
+  # layer with the gateway token). R1_SHIM_ENABLED is OUR provisioning flag (gates the QR
+  # service/tile), not read by the plugin. The gateway reads these on the restart in step 6, so it
   # binds 18790 from the start (no port-collision race).
   if [ "${R1_SHIM_ENABLED}" = "1" ]; then
     [ -n "$R1_SHIM_TOKEN" ] || R1_SHIM_TOKEN="$(openssl rand -hex 32 2>/dev/null || tr -dc 'a-f0-9' </dev/urandom | head -c64)"
@@ -1025,8 +1020,9 @@ YAML
       echo "R1_SHIM_ENABLED=true"
       echo "R1_SHIM_TOKEN=${R1_SHIM_TOKEN}"
       echo "R1_SHIM_PORT=${R1_SHIM_PORT}"
+      echo "R1_SHIM_ALLOW_ALL_USERS=true"
     } >>"$HERMES_HOME_DIR/.env"
-    echo "[stage] Hermes R1 channel: r1_shim on :${R1_SHIM_PORT} (fixed token; pairing tile in dashboard)"
+    echo "[stage] Hermes R1 channel: r1_shim plugin on :${R1_SHIM_PORT} (fixed token; pairing tile in dashboard)"
   fi
   [ -n "$tg_bot" ] && echo "TELEGRAM_BOT_TOKEN=${tg_bot}" >>"$HERMES_HOME_DIR/.env"
   if [ -n "$tg_user" ]; then
@@ -1320,8 +1316,8 @@ EOF
 # ----------------------------------------------------------
 # Stage 1e: Rabbit R1 channel — pairing QR + dashboard tile
 # ----------------------------------------------------------
-# stage_hermes already installed the third-party r1_shim adapter (adapter + source patch, step 2b)
-# and enabled it via ~/.hermes/.env (R1_SHIM_ENABLED/TOKEN/PORT), so the gateway listens on :18790.
+# stage_hermes already installed the third-party r1_shim plugin (step 2b) and configured it via
+# ~/.hermes/.env (R1_SHIM_TOKEN/PORT/ALLOW_ALL_USERS), so the gateway listens on :18790.
 # This stage adds the operator-facing half: render the pairing QR (intern-r1-qr.service,
 # re-run after every gateway start so the embedded LAN IPs stay current across DHCP /
 # reboots) and surface it as a tile inside the Hermes dashboard. The QR/JS/JSON are served
