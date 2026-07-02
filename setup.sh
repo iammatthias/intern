@@ -22,8 +22,12 @@
 #   OPENROUTER_API_KEY      Hermes LLM key for the unpaired/BYO path
 #   HERMES_MODEL            Optionally pin the default chat model (default: unset — pick it in
 #                           the dashboard). HERMES_FALLBACK_MODEL adds an explicit fallback.
+#   TIMEZONE                OS + agent timezone (default: America/Los_Angeles). Applied via
+#                           timedatectl, the `timezone:` key in Hermes config.yaml, and a TZ
+#                           env on the gateway unit, so agent clocks match the operator's.
 #   R1_SHIM_ENABLED         1 (default) | 0 — install the Rabbit R1 channel (third-party shim)
-#   R1_SHIM_TOKEN           Fixed R1 pairing token (default: auto-generated; keeps the QR stable)
+#   R1_SHIM_TOKEN           Fixed R1 pairing token (default: reuse the one already in ~/.hermes/.env,
+#                           else auto-generate; either way the QR stays stable across re-runs)
 #   R1_SHIM_PORT            R1 shim WebSocket port (default: 18790)
 #   R1_SHIM_REPO            Plugin repo (owner/repo) for `hermes plugins install`
 #                           (default: iammatthias/r1-hermes-shim)
@@ -108,6 +112,11 @@ HERMES_FALLBACK_MODEL="${HERMES_FALLBACK_MODEL:-}"
 # "No endpoints found that support image input"), so image understanding — e.g. R1
 # camera photos via vision_analyze — needs an explicit multimodal model here.
 HERMES_VISION_MODEL="${HERMES_VISION_MODEL:-google/gemini-3-flash-preview}"
+# OS + agent timezone. Hermes treats an empty/missing `timezone:` as "server local", which on a
+# fresh Pi means UTC — the agent then timestamps everything seven-ish hours off the operator's
+# day. Pin it in all three places the clock leaks: the OS (timedatectl, stage_locale), the Hermes
+# config.yaml `timezone:` key, and a TZ env on the gateway unit (both in stage_hermes).
+TIMEZONE="${TIMEZONE:-America/Los_Angeles}"
 
 # Rabbit R1 channel. r1_shim is a THIRD-PARTY Hermes PLATFORM PLUGIN
 # (github.com/iammatthias/r1-hermes-shim), NOT an upstream Hermes feature. stage_hermes installs
@@ -217,6 +226,14 @@ stage_locale() {
     update-locale LANG=C.UTF-8 LC_ALL=C.UTF-8
   else
     printf 'LANG=C.UTF-8\nLC_ALL=C.UTF-8\n' > /etc/default/locale
+  fi
+
+  # OS timezone (see TIMEZONE at the top). The agent-side settings live in stage_hermes;
+  # this covers everything else on the box: journal timestamps, cron/timers, `date`.
+  if timedatectl set-timezone "$TIMEZONE" 2>/dev/null; then
+    echo "[stage] OS timezone set to $TIMEZONE"
+  else
+    echo "[stage] WARN: could not set OS timezone to $TIMEZONE (check 'timedatectl list-timezones')"
   fi
 }
 
@@ -802,12 +819,16 @@ stage_hermes() {
   printf 'y\ny\ny\ny\ny\n' | hermes gateway install --system --force --run-as-user root
 
   # Resource guardrail (ours, not from the docs): keep the gateway from ballooning on a
-  # RAM-constrained Pi; mirrors the old openclaw.service cap.
+  # RAM-constrained Pi; mirrors the old openclaw.service cap. TZ pins the gateway process
+  # itself to the operator timezone — config.yaml's `timezone:` covers the agent, but
+  # anything in the process that reads the C library clock uses this. NB: no quotes around
+  # the Environment= value; systemd would keep them as literal characters.
   mkdir -p /etc/systemd/system/hermes-gateway.service.d
-  cat >/etc/systemd/system/hermes-gateway.service.d/override.conf <<'EOF'
+  cat >/etc/systemd/system/hermes-gateway.service.d/override.conf <<EOF
 [Service]
 MemoryMax=1500M
 LimitNOFILE=65535
+Environment=TZ=${TIMEZONE}
 EOF
   systemctl daemon-reload
 
@@ -859,9 +880,23 @@ EOF
     llm_model=$(jq -r '.llm_model // empty' "$DEVICE_CONFIG")
     llm_base_url=$(jq -r '.llm_base_url // empty' "$DEVICE_CONFIG")
   fi
-  # OpenRouter key for the unpaired (bring-your-own) path.
+  # OpenRouter key for the unpaired (bring-your-own) path. On a re-run, fall back to the
+  # key already in .env — see the harvest block in step 5 for the full rationale.
   local or_key="$OPENROUTER_API_KEY"
-  if [ -n "$llm_key" ] && [ -n "$llm_model" ] && [ -n "$llm_base_url" ]; then
+  _env_prev() { grep -E "^$1=" "$HERMES_HOME_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2-; }
+  [ -n "$or_key" ] || or_key="$(_env_prev OPENROUTER_API_KEY)"
+  # Re-runs must NOT regenerate an existing config.yaml: the dashboard persists the picked
+  # chat model into it, and the LED hooks + timezone were appended at provision time —
+  # a rewrite silently resets the model to "none" and drops any hand edits. Regenerate
+  # only when the file doesn't exist yet (delete it deliberately to force a rewrite).
+  local fresh_config=1
+  [ -f "$HERMES_HOME_DIR/config.yaml" ] && fresh_config=0
+  if [ "$fresh_config" = "0" ]; then
+    echo "[stage] Existing config.yaml found — preserving it (delete it and re-run to regenerate)"
+    # have_llm only decides how loudly a gateway start failure is treated in step 6.
+    grep -qE '^[[:space:]]*provider:' "$HERMES_HOME_DIR/config.yaml" 2>/dev/null && have_llm=1
+    { [ -n "$or_key" ] || [ -n "$llm_key" ]; } && have_llm=1
+  elif [ -n "$llm_key" ] && [ -n "$llm_model" ] && [ -n "$llm_base_url" ]; then
     have_llm=1
     # Paired device: Autonomous proxy (Anthropic Messages). intern-server's sync loop
     # refreshes the models map once active_agent=hermes.
@@ -947,6 +982,14 @@ memory:
 YAML
   fi
 
+  # Agent timezone (fresh config only — appended here so all three generation branches get
+  # it). An empty/missing `timezone:` means "server local", which Hermes resolves
+  # unreliably; explicit is the only setting that sticks. The gateway restart in step 6
+  # picks it up — a running gateway caches TZ at start.
+  if [ "$fresh_config" = "1" ]; then
+    echo "timezone: '${TIMEZONE}'" >>"$HERMES_HOME_DIR/config.yaml"
+  fi
+
   # --- 4b. LED bridge: drive intern-server's LED ring from Hermes activity. A shell
   # hook fires on lifecycle events and POSTs the matching state to intern-server's
   # /api/led (idle | thinking | working). This is what makes the ring animate while the
@@ -969,6 +1012,9 @@ EOF
   chmod +x /usr/local/bin/intern-led-from-hermes
   # Append the hook wiring to config.yaml (top-level keys; preserved by intern-server's
   # YAML-roundtrip sync loop). hooks_auto_accept lets them run headless without consent.
+  # Fresh config only — a preserved config.yaml already has this block, and a duplicate
+  # top-level `hooks:` key is invalid YAML. (The helper script above IS refreshed each run.)
+  if [ "$fresh_config" = "1" ]; then
   cat >>"$HERMES_HOME_DIR/config.yaml" <<'YAML'
 hooks_auto_accept: true
 hooks:
@@ -993,6 +1039,7 @@ hooks:
     - command: /usr/local/bin/intern-led-from-hermes
       timeout: 5
 YAML
+  fi
   chmod 600 "$HERMES_HOME_DIR/config.yaml"
 
   # --- 5. .env: channel adapter tokens from the device config. Only set keys
@@ -1003,6 +1050,14 @@ YAML
     tg_bot=$(jq -r '.telegram_bot_token // empty' "$DEVICE_CONFIG")
     tg_user=$(jq -r '.telegram_user_id // empty' "$DEVICE_CONFIG")
   fi
+  # A re-run must not lose secrets that only live in the CURRENT .env. Worst offender: the
+  # R1 token — regenerating it invalidates the pairing QR and silently un-pairs the R1.
+  # Same for the OpenRouter key and Telegram creds when they came in via env/pairing on the
+  # first run and aren't in this run's environment. Precedence: env var / device config
+  # first, old .env as the fallback. Harvest BEFORE the truncation below.
+  [ -n "$R1_SHIM_TOKEN" ] || R1_SHIM_TOKEN="$(_env_prev R1_SHIM_TOKEN)"
+  [ -n "$tg_bot" ] || tg_bot="$(_env_prev TELEGRAM_BOT_TOKEN)"
+  [ -n "$tg_user" ] || tg_user="$(_env_prev TELEGRAM_ALLOWED_USERS)"
   : >"$HERMES_HOME_DIR/.env"
   chmod 600 "$HERMES_HOME_DIR/.env"
   # OpenRouter provider key (unpaired/BYO path) — Hermes only sends it to openrouter.ai.
@@ -2006,7 +2061,19 @@ if [ "\$APP" = "hermes" ]; then
   HERMES_HOME=/root/.hermes DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
     bash <(curl -fsSL https://hermes-agent.nousresearch.com/install.sh) \
     --skip-setup --branch ${HERMES_BRANCH} < /dev/null
-  systemctl restart hermes-gateway
+  # A reinstall can replace the dashboard dist. The dashboard service runs --skip-build, so a
+  # missing dist means it crash-loops ("no web dist found") — the exact first-provision bug,
+  # reintroduced through the update path. Rebuild if needed and re-inject the R1 tile.
+  HSRC=/usr/local/lib/hermes-agent
+  if [ -f "\$HSRC/web/package.json" ] && [ ! -f "\$HSRC/hermes_cli/web_dist/index.html" ]; then
+    echo "Rebuilding dashboard web dist (can take a few minutes on a Pi)..."
+    ( cd "\$HSRC/web" \
+        && export HOME=/root PATH="/root/.hermes/node/bin:\$HSRC/node_modules/.bin:\$PATH" \
+        && npm install --no-audit --no-fund && npm run build ) \
+      || echo "WARN: web dist rebuild failed — dashboard won't serve until: cd \$HSRC/web && npm run build"
+  fi
+  [ -x /usr/local/bin/intern-dashboard-r1-patch ] && /usr/local/bin/intern-dashboard-r1-patch || true
+  systemctl restart hermes-gateway hermes-dashboard
   echo "hermes updated (${HERMES_BRANCH})"
   exit 0
 fi
