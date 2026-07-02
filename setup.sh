@@ -25,6 +25,10 @@
 #   TIMEZONE                OS + agent timezone (default: America/Los_Angeles). Applied via
 #                           timedatectl, the `timezone:` key in Hermes config.yaml, and a TZ
 #                           env on the gateway unit, so agent clocks match the operator's.
+#   INTERN_BACKUP_REMOTE    Optional rsync/scp destination (user@host:path) each nightly
+#                           agent-state tarball is pushed to. Local tarballs land in
+#                           /var/backups/intern either way, but only an off-card copy
+#                           survives a dead SD. Needs a passwordless SSH key for root.
 #   R1_SHIM_ENABLED         1 (default) | 0 — install the Rabbit R1 channel (third-party shim)
 #   R1_SHIM_TOKEN           Fixed R1 pairing token (default: reuse the one already in ~/.hermes/.env,
 #                           else auto-generate; either way the QR stays stable across re-runs)
@@ -2118,6 +2122,135 @@ SOFTWAREUPDATE
 }
 
 # ----------------------------------------------------------
+# Stage 5: Power/thermal sentinel (brownout early warning)
+# ----------------------------------------------------------
+# A marginal PSU or cable shows up as undervoltage flags long before it becomes the
+# fan-pulsing boot loop that took the real Intern down (2026-07-01). The firmware flags
+# reset on every boot, so a clean reading after a reboot proves nothing about the past —
+# only periodic sampling catches a sagging supply while the box still runs. Trips land in
+# the journal as warnings: `journalctl -t intern-power`.
+stage_power_monitor() {
+  echo "[stage] Power/thermal sentinel (vcgencmd get_throttled, every 5 min)"
+  cat >/usr/local/bin/intern-power-monitor <<'EOF'
+#!/bin/bash
+# Sample the Pi firmware's power/thermal flags; log a decoded warning when any are set.
+# Bits: 0 undervoltage-now, 1 freq-capped-now, 2 throttled-now, 3 temp-limit-now;
+# 16-19 are the same events latched since boot.
+command -v vcgencmd >/dev/null 2>&1 || exit 0
+out=$(vcgencmd get_throttled 2>/dev/null) || exit 0
+hex="${out#throttled=}"
+v=$((hex)) 2>/dev/null || exit 0
+[ "$v" -eq 0 ] && exit 0
+msg="power/thermal flags $hex:"
+[ $((v & 0x1)) -ne 0 ]     && msg="$msg UNDERVOLTAGE-NOW"
+[ $((v & 0x2)) -ne 0 ]     && msg="$msg freq-capped-now"
+[ $((v & 0x4)) -ne 0 ]     && msg="$msg throttled-now"
+[ $((v & 0x8)) -ne 0 ]     && msg="$msg temp-limit-now"
+[ $((v & 0x10000)) -ne 0 ] && msg="$msg undervoltage-since-boot"
+[ $((v & 0x20000)) -ne 0 ] && msg="$msg freq-cap-since-boot"
+[ $((v & 0x40000)) -ne 0 ] && msg="$msg throttling-since-boot"
+[ $((v & 0x80000)) -ne 0 ] && msg="$msg temp-limit-since-boot"
+logger -t intern-power -p user.warning "$msg (check PSU + cable: the Pi 5 wants a dedicated 5V/5A USB-C supply)"
+EOF
+  chmod +x /usr/local/bin/intern-power-monitor
+
+  cat >/etc/systemd/system/intern-power-monitor.service <<'EOF'
+[Unit]
+Description=Sample Pi power/thermal flags (undervoltage early warning)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/intern-power-monitor
+EOF
+
+  cat >/etc/systemd/system/intern-power-monitor.timer <<'EOF'
+[Unit]
+Description=Run intern-power-monitor every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now intern-power-monitor.timer
+}
+
+# ----------------------------------------------------------
+# Stage 6: Nightly backup of the agent state (SD cards die)
+# ----------------------------------------------------------
+# Everything that makes this device THIS intern lives in /root/.hermes (config.yaml, .env
+# secrets including the R1 pairing token, MEMORY.md, skills, plugins, profiles, styx) plus
+# /root/config/config.json — all of it on the SD card, the most mortal storage there is.
+# Nightly tarball to /var/backups/intern (14 kept) turns a bad edit into a restore; set
+# INTERN_BACKUP_REMOTE to also push each tarball off the card, which is what actually
+# survives a dead SD. Runs at 03:30 local time. Run `intern-backup` by hand anytime.
+stage_backup() {
+  echo "[stage] Nightly agent-state backup (/var/backups/intern, keep 14)"
+  cat >/usr/local/bin/intern-backup <<EOF
+#!/bin/bash
+# Tar the agent state. Big/rebuildable trees (node runtime, sessions, caches, plugin .git)
+# are excluded — this is a "who the agent is" backup, not a disk image.
+# Restore: stop hermes-gateway, tar xzf <backup> -C /root, start hermes-gateway.
+set -euo pipefail
+OUT_DIR="\${INTERN_BACKUP_DIR:-/var/backups/intern}"
+REMOTE="\${INTERN_BACKUP_REMOTE:-${INTERN_BACKUP_REMOTE:-}}"
+KEEP="\${INTERN_BACKUP_KEEP:-14}"
+STAMP=\$(date +%Y%m%d-%H%M%S)
+OUT="\$OUT_DIR/intern-\$STAMP.tar.gz"
+mkdir -p "\$OUT_DIR"
+members=".hermes"
+[ -d /root/config ] && members="\$members config"
+# tar exits 1 for "file changed as we read it" (a live gateway writes logs/sessions);
+# that's fine for our members, anything worse is not.
+tar czf "\$OUT" \\
+  --exclude='.hermes/node' \\
+  --exclude='.hermes/sessions' \\
+  --exclude='.hermes/profiles/*/sessions' \\
+  --exclude='.hermes/logs' \\
+  --exclude='.hermes/plugins/*/.git' \\
+  --exclude='*__pycache__*' \\
+  -C /root \$members || [ \$? -eq 1 ]
+# Rotate: newest KEEP stay.
+ls -1t "\$OUT_DIR"/intern-*.tar.gz 2>/dev/null | tail -n +\$((KEEP+1)) | xargs -r rm -f
+if [ -n "\$REMOTE" ]; then
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -az "\$OUT" "\$REMOTE" || echo "WARN: remote push to \$REMOTE failed" >&2
+  else
+    scp -q "\$OUT" "\$REMOTE" || echo "WARN: remote push to \$REMOTE failed" >&2
+  fi
+fi
+echo "intern-backup: wrote \$OUT (\$(du -h "\$OUT" | cut -f1))\${REMOTE:+, pushed to \$REMOTE}"
+EOF
+  chmod +x /usr/local/bin/intern-backup
+
+  cat >/etc/systemd/system/intern-backup.service <<'EOF'
+[Unit]
+Description=Nightly backup of the intern agent state
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/intern-backup
+EOF
+
+  cat >/etc/systemd/system/intern-backup.timer <<'EOF'
+[Unit]
+Description=Run intern-backup nightly
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now intern-backup.timer
+}
+
+# ----------------------------------------------------------
 # Main
 # ----------------------------------------------------------
 ensure_root
@@ -2156,6 +2289,8 @@ else
   stage_firewall
 fi
 stage_software_update
+stage_power_monitor
+stage_backup
 
 if [ "$AP_DECISION" = "ap" ]; then
   # wlan0 must stay NM-managed until here: on a Pi-Imager-flashed image the provisioning
@@ -2203,6 +2338,8 @@ echo "Agent:      hermes $HERMES_BRANCH (active_agent in $DEVICE_CONFIG); model:
 echo "Backends:   systemctl status bootstrap intern hermes-gateway intern-gateway-shim"
 echo "Memory:     Hermes built-in (MEMORY.md + skills/procedural) — no external store"
 echo "Updates:    software-update <intern|bootstrap|web|hermes>"
+echo "Backups:    nightly 03:30 -> /var/backups/intern (intern-backup to run now)"
+echo "Power:      undervoltage sentinel every 5 min (journalctl -t intern-power)"
 if [ -z "${TS_AUTHKEY:-}" ]; then
   echo "TODO:       tailscale up --hostname=$TS_NAME && tailscale serve --bg --https=443 http://127.0.0.1:9080"
 fi
