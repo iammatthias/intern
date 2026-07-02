@@ -17,8 +17,8 @@
 #   TS_AUTHKEY              Tailscale auth key for unattended join (else: run `tailscale up` later)
 #   TS_HOSTNAME             Tailnet hostname (default: intern-<serial suffix>)
 #   HERMES_BRANCH           Branch/tag the installer clones (default: main)
-#   HERMES_REF              Commit to pin after clone (default: a main commit with the #48507
-#                           batch-memory feature; set "" to track HERMES_BRANCH HEAD)
+#   HERMES_REF              Commit to pin after clone (default: a v0.18.0-era main commit;
+#                           set "" to track HERMES_BRANCH HEAD)
 #   OPENROUTER_API_KEY      Hermes LLM key for the unpaired/BYO path
 #   HERMES_MODEL            Optionally pin the default chat model (default: unset — pick it in
 #                           the dashboard). HERMES_FALLBACK_MODEL adds an explicit fallback.
@@ -95,14 +95,14 @@ WEB_ROOT="/usr/share/caddy/setup"
 HERMES_HOME_DIR="/root/.hermes"
 # Hermes source pin. The installer clones HERMES_BRANCH (its `--branch` accepts a tag or a
 # branch); HERMES_REF optionally checks out a commit afterward for reproducibility. We track
-# `main` pinned to a commit, because the skills we want (e.g. the /learn skill) are on main
-# ahead of the latest tag (v2026.6.19 == 0.17.0 predates them). Cloning the `main` BRANCH (not a
-# tag) is ALSO what keeps the native `hermes update` working: a `--branch <tag>` clone is
+# `main` pinned to a commit — currently a v0.18.0-era main commit just past the v2026.7.1 tag
+# (persists per-session /model overrides across gateway restarts). Cloning the `main` BRANCH
+# (not a tag) is ALSO what keeps the native `hermes update` working: a `--branch <tag>` clone is
 # single-branch with no origin/main, so `hermes update` can't switch to main; a main clone tracks
 # origin/main. Set HERMES_REF="" to ride main HEAD, bump it to a newer commit, or move to a tag
-# (HERMES_BRANCH=v<tag>, HERMES_REF="") once one ships the skills we're tracking.
+# (HERMES_BRANCH=v<tag>, HERMES_REF="") once tags catch up with what we're tracking.
 HERMES_BRANCH="${HERMES_BRANCH:-main}"
-HERMES_REF="${HERMES_REF:-f53b184c48712bcbb98556a6314cd1f240fc104d}"
+HERMES_REF="${HERMES_REF:-30e947e0a05ef535e4b25a183d8bbe34fd68d1d5}"
 # Pairing-time device config (LLM key/model/base_url, channel tokens, active_agent)
 DEVICE_CONFIG="/root/config/config.json"
 # Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own OpenRouter.
@@ -1182,6 +1182,10 @@ After=network-online.target
 [Service]
 User=root
 Environment="HOME=/root"
+# Re-inject the R1 pairing tile on every start: `hermes update` replaces web_dist and
+# silently drops the patch. Idempotent and instant when already applied; the leading '-'
+# tolerates the tool not existing yet (stage_r1_shim installs it after this stage).
+ExecStartPre=-/usr/local/bin/intern-dashboard-r1-patch
 # --skip-build serves the prebuilt web_dist (no npm build on every start). NB: do NOT
 # pass --tui — v0.16.0 removed that flag and rejects it (the chat tab is built in now).
 ExecStart=/usr/local/bin/hermes dashboard --no-open --host 127.0.0.1 --port 9119 --skip-build
