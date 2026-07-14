@@ -6,7 +6,8 @@
 #   - Hermes agent     gateway as a systemd service, pinned to a release tag
 #                      (memory = Hermes' built-in MEMORY.md + skills/procedural; no external store)
 #   - Tailscale        SSH over the tailnet + the Hermes dashboard published tailnet-only
-#   - Rabbit R1        optional OpenClaw-compatible channel (third-party r1_shim) + pairing QR
+#   - Rabbit R1        optional; rabbit's official rabbit-agent node (native rabbitOS support),
+#                      plus a legacy third-party r1_shim channel (archived, off by default)
 #   - Firewall         iptables lockdown of 22/80/443/5000/8080 on physical interfaces
 #                      (loopback, tailscale0, and the AP subnet 192.168.100.0/24 stay open)
 #
@@ -29,7 +30,13 @@
 #                           agent-state tarball is pushed to. Local tarballs land in
 #                           /var/backups/intern either way, but only an off-card copy
 #                           survives a dead SD. Needs a passwordless SSH key for root.
-#   R1_SHIM_ENABLED         1 (default) | 0 — install the Rabbit R1 channel (third-party shim)
+#   RABBIT_AGENT_TOKEN      Node registration token from hole.rabbit.tech (Settings -> Nodes ->
+#                           Register Node). Installs rabbit's official rabbit-agent so the R1
+#                           drives Hermes natively. One-time: after registration the agent keeps
+#                           its own connection.json and re-runs work without the token.
+#   R1_SHIM_ENABLED         0 (default) | 1 — legacy third-party r1_shim channel. The shim repo
+#                           is archived (rabbitOS supports Hermes natively now); set 1 only for
+#                           a device still paired via the shim QR.
 #   R1_SHIM_TOKEN           Fixed R1 pairing token (default: reuse the one already in ~/.hermes/.env,
 #                           else auto-generate; either way the QR stays stable across re-runs)
 #   R1_SHIM_PORT            R1 shim WebSocket port (default: 18790)
@@ -95,14 +102,14 @@ WEB_ROOT="/usr/share/caddy/setup"
 HERMES_HOME_DIR="/root/.hermes"
 # Hermes source pin. The installer clones HERMES_BRANCH (its `--branch` accepts a tag or a
 # branch); HERMES_REF optionally checks out a commit afterward for reproducibility. We track
-# `main` pinned to a commit — currently a v0.18.0-era main commit just past the v2026.7.1 tag
-# (persists per-session /model overrides across gateway restarts). Cloning the `main` BRANCH
+# `main` pinned to a commit — currently a v0.18.2-era main commit past the v2026.7.7.2 tag
+# (what the live device runs as of 2026-07-14). Cloning the `main` BRANCH
 # (not a tag) is ALSO what keeps the native `hermes update` working: a `--branch <tag>` clone is
 # single-branch with no origin/main, so `hermes update` can't switch to main; a main clone tracks
 # origin/main. Set HERMES_REF="" to ride main HEAD, bump it to a newer commit, or move to a tag
 # (HERMES_BRANCH=v<tag>, HERMES_REF="") once tags catch up with what we're tracking.
 HERMES_BRANCH="${HERMES_BRANCH:-main}"
-HERMES_REF="${HERMES_REF:-30e947e0a05ef535e4b25a183d8bbe34fd68d1d5}"
+HERMES_REF="${HERMES_REF:-46e87b14fd6c943ef0d6671fb0d74c5dde5d4c6b}"
 # Pairing-time device config (LLM key/model/base_url, channel tokens, active_agent)
 DEVICE_CONFIG="/root/config/config.json"
 # Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own OpenRouter.
@@ -122,17 +129,26 @@ HERMES_VISION_MODEL="${HERMES_VISION_MODEL:-google/gemini-3-flash-preview}"
 # config.yaml `timezone:` key, and a TZ env on the gateway unit (both in stage_hermes).
 TIMEZONE="${TIMEZONE:-America/Los_Angeles}"
 
-# Rabbit R1 channel. r1_shim is a THIRD-PARTY Hermes PLATFORM PLUGIN
-# (github.com/iammatthias/r1-hermes-shim), NOT an upstream Hermes feature. stage_hermes installs
-# it with `hermes plugins install` into ~/.hermes/plugins/, so it needs ZERO Hermes source edits
-# and survives `hermes update` (earlier versions patched the source tree and broke on every
-# upgrade). It is an OpenClaw-compatible WS gateway and MUST NOT share :18789 with the
+# Rabbit R1 channel. The supported path is rabbit's own integration: rabbitOS drives third-party
+# agents (Hermes included) through a "rabbit agent" node that runs next to Hermes and connects
+# out to rabbit's cloud, so the R1 works from any network. No LAN pairing, no QR. Register the
+# node at hole.rabbit.tech (Settings -> Nodes -> Register Node), pass the token as
+# RABBIT_AGENT_TOKEN, and stage_rabbit_agent runs rabbit's official installer with it
+# (https://www.rabbit.tech/support/article/agents-on-rabbit-r1). It runs as root on purpose:
+# root is where HERMES_HOME (/root/.hermes: config, keys, memory) lives, so the R1 gets the
+# same brain as every other channel.
+RABBIT_AGENT_TOKEN="${RABBIT_AGENT_TOKEN:-}"
+
+# LEGACY R1 path: the third-party r1_shim plugin (github.com/iammatthias/r1-hermes-shim, now
+# ARCHIVED) predates rabbit's native support. It is an OpenClaw-compatible WS gateway the R1
+# pairs to over the LAN via QR, installed with `hermes plugins install` into ~/.hermes/plugins/
+# (zero Hermes source edits, survives `hermes update`). It MUST NOT share :18789 with the
 # intern-gateway-shim stub (intern-server needs that one), so it runs on :18790. A fixed token
-# keeps the pairing QR stable across reboots (pair once) and is what auto-enables the channel via
-# the plugin's env_enablement hook. The QR is rendered to /usr/share/caddy/r1 and shown as a tile
-# in the Hermes dashboard (stage_r1_shim).
-# Set R1_SHIM_ENABLED=0 to skip the channel; leave the token empty to auto-generate one.
-R1_SHIM_ENABLED="${R1_SHIM_ENABLED:-1}"
+# keeps the pairing QR stable across reboots and is what auto-enables the channel via the
+# plugin's env_enablement hook. The QR is rendered to /usr/share/caddy/r1 and shown as a tile
+# in the Hermes dashboard (stage_r1_shim). Off by default; set R1_SHIM_ENABLED=1 only for a
+# device still paired this way.
+R1_SHIM_ENABLED="${R1_SHIM_ENABLED:-0}"
 R1_SHIM_PORT="${R1_SHIM_PORT:-18790}"
 R1_SHIM_TOKEN="${R1_SHIM_TOKEN:-}"
 # The plugin repo, in `hermes plugins install` owner/repo shorthand (set GITHUB_TOKEN if private).
@@ -1625,6 +1641,40 @@ R1UNIT
 }
 
 # ----------------------------------------------------------
+# Rabbit R1 — rabbit's official rabbit-agent node
+# ----------------------------------------------------------
+# rabbitOS's native bridge to agents on this box (Hermes, Claude Code, OpenClaw). The R1
+# talks to rabbit's cloud, the node connects out from here, so the R1 works away from the
+# home LAN too. Setup doc: https://www.rabbit.tech/support/article/agents-on-rabbit-r1
+#
+# The official installer (agent.rabbit.tech/install.sh) drops a signed arm64 binary into
+# $HOME/.rabbit-agent, starts it, and keeps itself alive with its own crontab entries
+# (@reboot + every 10 min), so there is no systemd unit to write here. We run it as root
+# on purpose: the node drives the `hermes` CLI, and root is where HERMES_HOME
+# (/root/.hermes: config, keys, memory) lives.
+#
+# Registration is one-time. Pass RABBIT_AGENT_TOKEN on the first run (from hole.rabbit.tech
+# -> Settings -> Nodes -> Register Node); the pairing persists in
+# /root/.rabbit-agent/connection.json and later re-runs just refresh the binary.
+# After install: on the R1, swipe to the Hermes Agent page and tap "click to refresh".
+stage_rabbit_agent() {
+  if [ -z "$RABBIT_AGENT_TOKEN" ] && [ ! -f /root/.rabbit-agent/connection.json ]; then
+    echo "[stage] rabbit-agent: no RABBIT_AGENT_TOKEN and no prior registration — skipping"
+    echo "[stage]   register at hole.rabbit.tech (Settings -> Nodes), then re-run with the token"
+    return 0
+  fi
+  echo "[stage] rabbit-agent: install/refresh (native R1 -> Hermes node)"
+  local token_arg=""
+  [ -n "$RABBIT_AGENT_TOKEN" ] && token_arg="--token=$RABBIT_AGENT_TOKEN"
+  # shellcheck disable=SC2086
+  if curl -fsSL https://agent.rabbit.tech/install.sh | bash -s -- $token_arg </dev/null; then
+    echo "[stage] rabbit-agent up (state: /root/.rabbit-agent, logs: /root/.rabbit-agent/logs)"
+  else
+    echo "[stage] WARN: rabbit-agent install failed — native R1 channel not set up"
+  fi
+}
+
+# ----------------------------------------------------------
 # Stage 2a: Firewall — bind dashboard + SSH to the tailnet
 # Drops 22/80/443/5000 on physical interfaces; loopback, tailscale0 and the
 # AP onboarding subnet (192.168.100.0/24) stay open. Applied at boot via systemd.
@@ -2270,7 +2320,8 @@ stage_tailscale      # before AP switch: needs internet to join the tailnet
 stage_hermes
 stage_hermes_dashboard   # before caddy: writes /etc/intern-dashboard-url for the wizard redirect
 stage_caddy
-stage_r1_shim            # after caddy (/r1 route) + dashboard dist: R1 pairing QR + tile
+stage_r1_shim            # legacy R1 path, off by default (R1_SHIM_ENABLED=1 to keep a QR-paired device)
+stage_rabbit_agent       # native R1 path: rabbit's own node (needs RABBIT_AGENT_TOKEN once)
 
 # Provision Wi-Fi from env (if given), then decide: AP/captive-portal onboarding vs
 # keep the existing connection. AP_MODE=auto skips the AP when Wi-Fi is configured.

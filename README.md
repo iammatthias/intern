@@ -16,13 +16,13 @@ It's a reworked version of the stock [`setup.sh`](https://cdn.autonomous.ai/inte
 |-----------|------|
 | **Caddy** | Serves the setup web UI on `:80`, reverse-proxies `/api/*` to `intern-server:5000`, plus a loopback `:9080` Host/Origin-rewrite hop for the dashboard |
 | **intern backend** | The Autonomous `intern-server` (LED ring on SPI0, Wi-Fi onboarding API) |
-| **Hermes agent** | Gateway as a systemd service (`hermes-gateway`), pinned to a fixed upstream commit (currently a `main` commit, for the batch-memory work that isn't in a release tag yet) |
+| **Hermes agent** | Gateway as a systemd service (`hermes-gateway`), pinned to a fixed upstream `main` commit (currently v0.18.2-era, past the v2026.7.7.2 tag) |
 | **Memory** | Hermes' built-in store: a ~2k `MEMORY.md` plus the skills and procedural memory it writes itself. No vector DB, no Docker. See [Memory](#memory) |
 | **Tailscale** | SSH over the tailnet (regular sshd, key auth), and the Hermes dashboard published tailnet-only on standard HTTPS `:443` |
 | **Hermes dashboard** | Web UI for config, API keys, and chat (`hermes-dashboard`, loopback `:9119`) |
 | **LED bridge** | Hermes lifecycle hooks post to `intern-server`'s `/api/led` so the ring tracks what the agent is doing (idle, thinking, working) |
 | **Gateway shim** | `intern-gateway-shim` answers the OpenClaw `:18789` WS handshake so `intern-server` stops reconnect-looping under Hermes |
-| **Rabbit R1 channel** | Optional. The third-party [`r1_shim`][r1-shim] adapter on `:18790`, plus a pairing QR rendered into the dashboard as a tile |
+| **Rabbit R1 channel** | Optional. rabbit's official rabbit-agent node (native rabbitOS support, needs a one-time token from [rabbithole](https://hole.rabbit.tech)). The old third-party [`r1_shim`][r1-shim] path is archived and off by default |
 | Base plumbing | locale, RPi-5 Wi-Fi stability, SPI enable (runtime and reboot), AP/STA Wi-Fi switching (hostapd/dnsmasq), OTA backend, firewall |
 
 ## Memory
@@ -64,9 +64,10 @@ TS_AUTHKEY=tskey-... \
 | `TS_AUTHKEY` / `TS_HOSTNAME` | Tailscale unattended join and tailnet hostname (default `intern-<serial>`) |
 | `OPENROUTER_API_KEY` | LLM key for Hermes on the unpaired (bring-your-own) path |
 | `HERMES_MODEL` / `HERMES_FALLBACK_MODEL` | optional. Pin a chat model. Default is unset, so you pick it in the dashboard |
-| `HERMES_BRANCH` / `HERMES_REF` | Branch the installer clones (default `main`) and the commit it pins to (default: a `main` commit with the batch-memory feature). Set `HERMES_REF` empty to track the branch HEAD |
-| `R1_SHIM_ENABLED` / `R1_SHIM_TOKEN` / `R1_SHIM_PORT` | Rabbit R1 channel: on by default, token auto-generated (fixed), port `18790` |
-| `R1_SHIM_REPO_RAW` | Source of the `r1_shim` adapter and Hermes patch ([iammatthias/r1-hermes-shim][r1-shim]) |
+| `HERMES_BRANCH` / `HERMES_REF` | Branch the installer clones (default `main`) and the commit it pins to (default: a v0.18.2-era `main` commit, what the live device runs). Set `HERMES_REF` empty to track the branch HEAD |
+| `RABBIT_AGENT_TOKEN` | Rabbit R1 channel: node registration token from [rabbithole](https://hole.rabbit.tech) (Settings → Nodes → Register Node). One-time; re-runs don't need it |
+| `R1_SHIM_ENABLED` / `R1_SHIM_TOKEN` / `R1_SHIM_PORT` | Legacy R1 shim channel: off by default now that rabbitOS supports Hermes natively. Set `R1_SHIM_ENABLED=1` only for a device still paired via the shim QR (fixed token, port `18790`) |
+| `R1_SHIM_REPO` | Plugin repo for the legacy shim ([iammatthias/r1-hermes-shim][r1-shim], archived) |
 | `AP_MODE` | `auto` (default), `force`, or `skip`. Captive-portal onboarding vs. use existing Wi-Fi |
 | `SKIP_AP` / `SKIP_FIREWALL` / `SKIP_REBOOT` | desk/dev opt-outs |
 | `WIFI_SSID` / `WIFI_PASS` | provision Wi-Fi up front so a flashed image comes up online |
@@ -86,8 +87,8 @@ With the firewall on, SSH the Pi over the tailnet (`ssh <user>@<tailnet-ip>`). L
 - **Dashboard is tailnet-only** via `tailscale serve :443` → Caddy `:9080` → `:9119`. Caddy rewrites Host/Origin/X-Forwarded-Proto for the dashboard's anti-DNS-rebinding guard. Port 443, not :8443, is deliberate: iCloud Private Relay only relays 80/443.
 - **Firewall** (`stage_firewall`, on unless `SKIP_FIREWALL=1`) locks `22/80/443/5000/8080` to loopback, `tailscale0`, and the AP subnet. It doesn't turn on Tailscale SSH, so use the regular sshd over the tailnet.
 - **Auxiliary tasks pinned to OpenRouter** so Hermes never probes its Nous inference fallback, which 402s without Nous credits.
-- **Rabbit R1** (`stage_r1_shim`) is a third-party [`r1_shim`][r1-shim], not upstream Hermes. The script patches it into the Hermes checkout, so a `hermes update` wipes it; re-run to re-apply. Runs on `:18790`. A fixed token keeps the pairing QR stable, shown as a 🐰 tile. `R1_SHIM_ENABLED=0` skips it.
-- **`hermes update` is broken** out of the box (stale single-branch pin). Bump `HERMES_BRANCH`/`HERMES_REF` and re-run, or check out the ref by hand. Hermes is an editable install, so a `git checkout` plus a gateway restart swaps the running code when no dependencies changed.
+- **Rabbit R1** (`stage_rabbit_agent`) uses rabbit's own agent integration: a rabbit-agent node runs on the Pi as root (so it shares `/root/.hermes` with every other channel) and connects out to rabbit's cloud, which means the R1 works away from your LAN. Register the node at [rabbithole](https://hole.rabbit.tech) (Settings → Nodes → Register Node) and pass the token as `RABBIT_AGENT_TOKEN` once; rabbit's installer keeps itself alive via its own cron entries. Setup doc: [Agents on rabbit r1](https://www.rabbit.tech/support/article/agents-on-rabbit-r1). The old LAN/QR path (`stage_r1_shim`, the archived [`r1_shim`][r1-shim] plugin on `:18790`) is off by default; `R1_SHIM_ENABLED=1` keeps it for a device already paired that way.
+- **`hermes update` works** on installs from this script (it clones the `main` branch, so `origin/main` exists). To move the pin, bump `HERMES_REF` and re-run, or `hermes update --yes --branch main` on the device.
 
 The inline comments in `setup` carry the full rationale for each stage.
 
@@ -95,7 +96,8 @@ The inline comments in `setup` carry the full rationale for each stage.
 
 - [autonomous-intern](https://github.com/autonomous-ai/autonomous-intern) and the stock [`setup.sh`](https://cdn.autonomous.ai/intern/setup.sh), Autonomous. This is a rework of that.
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent), Nous Research
-- [r1-hermes-shim][r1-shim], the Rabbit R1 channel
+- [Agents on rabbit r1](https://www.rabbit.tech/support/article/agents-on-rabbit-r1), rabbit's native Hermes integration, the current R1 channel
+- [r1-hermes-shim][r1-shim], the R1 channel before rabbit shipped native support (archived)
 
 [r1-shim]: https://github.com/iammatthias/r1-hermes-shim
 
