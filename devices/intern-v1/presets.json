@@ -1,0 +1,4 @@
+{
+  "_comment": "Per-device preset overrides for intern-v1. The LED ring has 8 pixels (platform default is 64).",
+  "led_count": 8
+}

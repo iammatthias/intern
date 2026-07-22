@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  bash:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n (syntax, blocking)
+        run: bash -n setup.sh
+      - name: shellcheck (advisory while pre-existing findings get burned down)
+        continue-on-error: true
+        run: shellcheck setup.sh
+      - name: shellcheck errors only (blocking)
+        run: shellcheck --severity=error setup.sh
+
+  device-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch autonomous-os CTS (pinned, same ref setup.sh installs)
+        run: |
+          REF=$(grep -oE 'AUTONOMOUS_OS_REF:-[0-9a-f]+' setup.sh | cut -d- -f2)
+          git clone --filter=blob:none --no-checkout https://github.com/autonomous-ai/autonomous-os.git /tmp/aos
+          git -C /tmp/aos fetch --depth 1 origin "$REF"
+          git -C /tmp/aos checkout -f "$REF"
+      - name: run device conformance suite against our declaration
+        # The CTS hardcodes its repo-relative devices/ dir, so copy ours in; the suite
+        # then validates upstream's devices AND ours with the same parser the HAL runs.
+        run: |
+          cp -r "$GITHUB_WORKSPACE/devices/intern-v1" /tmp/aos/devices/
+          cd /tmp/aos
+          python3 -m unittest discover -s cts -v

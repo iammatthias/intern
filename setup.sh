@@ -2,9 +2,16 @@
 # intern — turn a fresh Raspberry Pi 5 (Raspberry Pi OS Trixie, SD card) into an
 # "Autonomous Intern" running the Hermes agent (Nous Research). Provisions, in order:
 #   - Caddy            setup web UI + API proxy (Cloudsmith apt repo)
-#   - intern backend   the Autonomous intern-server (LED ring, Wi-Fi onboarding API)
+#   - intern backend   the Autonomous intern-server (Wi-Fi onboarding API; used only during
+#                      AP onboarding — the open HAL below replaces it once online)
 #   - Hermes agent     gateway as a systemd service, pinned to a release tag
 #                      (memory = Hermes' built-in MEMORY.md + skills/procedural; no external store)
+#   - HAL              Autonomous OS's open hardware layer (autonomous-ai/autonomous-os os/hal,
+#                      FastAPI on loopback :5001) drives the WS2812 ring directly with per-frame
+#                      safety clamps (brightness ceiling + quiet hours from SAFETY.md). Replaces
+#                      the closed intern-server LED path AND the :18789 gateway shim.
+#   - Skills           first-party Autonomous skills adapted for this stack (repo skills/ ->
+#                      ~/.hermes/skills/): led-control, scene, quiet-mode, mood, habit, wellbeing
 #   - Tailscale        SSH over the tailnet + the Hermes dashboard published tailnet-only
 #   - Rabbit R1        optional; rabbit's official rabbit-agent node (native rabbitOS support),
 #                      plus a legacy third-party r1_shim channel (archived, off by default)
@@ -103,13 +110,13 @@ HERMES_HOME_DIR="/root/.hermes"
 # Hermes source pin. The installer clones HERMES_BRANCH (its `--branch` accepts a tag or a
 # branch); HERMES_REF optionally checks out a commit afterward for reproducibility. We track
 # `main` pinned to a commit — currently a v0.18.2-era main commit past the v2026.7.7.2 tag
-# (what the live device runs as of 2026-07-14). Cloning the `main` BRANCH
+# (what the live device runs as of 2026-07-20). Cloning the `main` BRANCH
 # (not a tag) is ALSO what keeps the native `hermes update` working: a `--branch <tag>` clone is
 # single-branch with no origin/main, so `hermes update` can't switch to main; a main clone tracks
 # origin/main. Set HERMES_REF="" to ride main HEAD, bump it to a newer commit, or move to a tag
 # (HERMES_BRANCH=v<tag>, HERMES_REF="") once tags catch up with what we're tracking.
 HERMES_BRANCH="${HERMES_BRANCH:-main}"
-HERMES_REF="${HERMES_REF:-46e87b14fd6c943ef0d6671fb0d74c5dde5d4c6b}"
+HERMES_REF="${HERMES_REF:-42bd4368aef12be890a74b749ae04d009c0a4412}"
 # Pairing-time device config (LLM key/model/base_url, channel tokens, active_agent)
 DEVICE_CONFIG="/root/config/config.json"
 # Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own OpenRouter.
@@ -153,6 +160,22 @@ R1_SHIM_PORT="${R1_SHIM_PORT:-18790}"
 R1_SHIM_TOKEN="${R1_SHIM_TOKEN:-}"
 # The plugin repo, in `hermes plugins install` owner/repo shorthand (set GITHUB_TOKEN if private).
 R1_SHIM_REPO="${R1_SHIM_REPO:-iammatthias/r1-hermes-shim}"
+
+# Autonomous OS HAL — the open hardware layer (github.com/autonomous-ai/autonomous-os,
+# Developer Edition, 2026-07). os/hal is a Python FastAPI daemon on loopback :5001 that
+# drives the WS2812 directly over spidev (6.4MHz, one WS2812 bit per SPI byte) with a
+# per-frame safety clamp (max_brightness + quiet hours) read from the device's SAFETY.md.
+# We pin a commit like we pin Hermes. NOTE: os/hal is GPL-3 (LeLamp fork) — it is cloned
+# from upstream at provision time, not vendored into this repo.
+# The device declaration (devices/intern-v1/{DEVICE.md,SAFETY.md,presets.json}) IS ours,
+# installed from this repo checkout (fallback: raw.githubusercontent).
+AUTONOMOUS_OS_REPO="${AUTONOMOUS_OS_REPO:-https://github.com/autonomous-ai/autonomous-os.git}"
+AUTONOMOUS_OS_REF="${AUTONOMOUS_OS_REF:-7f1d0792aeca0a9c06244a506dab442057b1456b}"
+HAL_DIR="/opt/hal"
+HAL_DEVICES_DIR="/opt/devices"
+HAL_DEVICE_TYPE="${HAL_DEVICE_TYPE:-intern-v1}"
+# Our repo, for fetching devices/ + skills/ when running outside a checkout.
+INTERN_REPO_RAW="${INTERN_REPO_RAW:-https://raw.githubusercontent.com/iammatthias/intern/main}"
 
 # AP onboarding mode: auto (default) | force | skip.
 #   auto  — skip the AP/captive-portal step when Wi-Fi is already configured (baked
@@ -267,7 +290,7 @@ stage_prerequisites() {
   apt install -y \
     hostapd dnsmasq unzip curl jq wpasupplicant dhcpcd iproute2 iptables \
     iw git ca-certificates gnupg apt-transport-https debian-keyring debian-archive-keyring \
-    qrencode openssl
+    qrencode openssl rsync
   systemctl stop hostapd dnsmasq 2>/dev/null || true
   systemctl unmask hostapd dnsmasq 2>/dev/null || true
   # Node.js/chromium/xvfb dropped from this list: the Hermes installer brings its
@@ -866,8 +889,15 @@ EOF
   # `hermes update` later re-attaches to HERMES_BRANCH and moves forward. Done AFTER
   # `hermes gateway install` (which re-checks-out the cloned branch).
   if [ -n "${HERMES_REF:-}" ]; then
+    # A stale shallow.lock from an interrupted fetch breaks every later fetch ("File
+    # exists") — recurring on this shallow clone (2026-06-27, 2026-07-14, 2026-07-16).
+    # An interrupted mid-run restart can also leave the RUNNING gateway on old code with
+    # a moved tree underneath: lazy imports then die with ImportErrors until a restart.
+    # The pin + pycache clear + editable-finder regen + the restart in step 6 realign it.
+    rm -f "$hlib/.git/shallow.lock"
     if git -C "$hlib" fetch --depth 1 origin "$HERMES_REF" \
        && git -C "$hlib" checkout -f "$HERMES_REF" \
+       && { find "$hlib" -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true; } \
        && "$hlib/venv/bin/pip" install -e "$hlib" --no-deps -q; then
       echo "[stage] Hermes pinned to commit $(git -C "$hlib" rev-parse --short HEAD)"
     else
@@ -903,7 +933,10 @@ EOF
   # OpenRouter key for the unpaired (bring-your-own) path. On a re-run, fall back to the
   # key already in .env — see the harvest block in step 5 for the full rationale.
   local or_key="$OPENROUTER_API_KEY"
-  _env_prev() { grep -E "^$1=" "$HERMES_HOME_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2-; }
+  # `|| true` is load-bearing: under pipefail a no-match grep fails the whole pipeline,
+  # and the callers assign straight from this substitution (set -e would kill the run).
+  # Bit us live 2026-07-16: the first re-run after OPENROUTER_API_KEY left .env died here.
+  _env_prev() { grep -E "^$1=" "$HERMES_HOME_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
   [ -n "$or_key" ] || or_key="$(_env_prev OPENROUTER_API_KEY)"
   # Re-runs must NOT regenerate an existing config.yaml: the dashboard persists the picked
   # chat model into it, and the LED hooks + timezone were appended at provision time —
@@ -1010,23 +1043,26 @@ YAML
     echo "timezone: '${TIMEZONE}'" >>"$HERMES_HOME_DIR/config.yaml"
   fi
 
-  # --- 4b. LED bridge: drive intern-server's LED ring from Hermes activity. A shell
-  # hook fires on lifecycle events and POSTs the matching state to intern-server's
-  # /api/led (idle | thinking | working). This is what makes the ring animate while the
-  # agent works; the WS shim only keeps intern-server's gateway link healthy.
+  # --- 4b. LED bridge: drive the ring from Hermes activity. A shell hook fires on
+  # lifecycle events and POSTs the matching look to the HAL (:5001). Palette carries
+  # over from intern-server's built-in effects (idle #00060c, thinking #009cc7,
+  # working #006ccc, error #cc2800). HAL clamps every frame (brightness ceiling +
+  # quiet hours), so the bridge never needs to know what time it is.
   cat >/usr/local/bin/intern-led-from-hermes <<'EOF'
 #!/usr/bin/env bash
-# Map a Hermes lifecycle hook (JSON on stdin) to an intern-server LED state and POST it.
-# Always print {} so the hook never blocks/rewrites the agent. States: idle|thinking|working|error.
+# Map a Hermes lifecycle hook (JSON on stdin) to a HAL LED look and POST it.
+# Always print {} so the hook never blocks/rewrites the agent.
 ev=$(jq -r '.hook_event_name // empty' 2>/dev/null)
 case "$ev" in
-  pre_llm_call|on_session_start|post_tool_call|subagent_stop) state=thinking ;;
-  pre_tool_call)                                              state=working ;;
-  post_llm_call|on_session_end|on_session_finalize|on_session_reset) state=idle ;;
-  *)                                                          state=idle ;;
+  pre_llm_call|on_session_start|post_tool_call|subagent_stop)
+    body='{"effect":"breathing","color":[0,156,199],"speed":1.5}' ;;   # thinking — cyan
+  pre_tool_call)
+    body='{"effect":"pulse","color":[0,108,204],"speed":0.8}' ;;       # working — blue
+  post_llm_call|on_session_end|on_session_finalize|on_session_reset|*)
+    body='{"effect":"breathing","color":[0,6,12],"speed":4.0}' ;;      # idle — near-dark blue
 esac
 curl -fsS -m 3 -X POST -H "Content-Type: application/json" \
-  -d "{\"state\":\"${state}\"}" http://127.0.0.1:5000/api/led >/dev/null 2>&1 || true
+  -d "$body" http://127.0.0.1:5001/led/effect >/dev/null 2>&1 || true
 printf '{}\n'
 EOF
   chmod +x /usr/local/bin/intern-led-from-hermes
@@ -1667,10 +1703,490 @@ stage_rabbit_agent() {
   local token_arg=""
   [ -n "$RABBIT_AGENT_TOKEN" ] && token_arg="--token=$RABBIT_AGENT_TOKEN"
   # shellcheck disable=SC2086
-  if curl -fsSL https://agent.rabbit.tech/install.sh | bash -s -- $token_arg </dev/null; then
+  # (No </dev/null here: with `curl | bash`, a stdin redirect would override the pipe
+  # and bash would execute nothing. That trap is real — shellcheck SC2259 caught it.)
+  if curl -fsSL https://agent.rabbit.tech/install.sh | bash -s -- $token_arg; then
     echo "[stage] rabbit-agent up (state: /root/.rabbit-agent, logs: /root/.rabbit-agent/logs)"
   else
     echo "[stage] WARN: rabbit-agent install failed — native R1 channel not set up"
+  fi
+}
+
+# ----------------------------------------------------------
+# HAL — Autonomous OS open hardware layer (replaces intern-server + the :18789 shim)
+# ----------------------------------------------------------
+# Installs os/hal from the pinned autonomous-os checkout into /opt/hal, declares OUR
+# device (devices/intern-v1: light + system required, audio/sensing optional so future
+# mic/speaker hardware mounts without a re-declare), and hands the SPI bus over: HAL and
+# intern-server can NOT both own /dev/spidev0.0 (two writers interleave garbage frames),
+# so once HAL is healthy we stop+disable intern.service AND intern-gateway-shim.service
+# (the shim exists solely to pacify intern-server's WS client).
+# AP-onboarding exception: a fresh device in AP mode still needs intern-server's
+# /api/network + /api/device/setup for the captive-portal wizard, so on that path we
+# install HAL but leave it stopped; the first re-run after onboarding flips the switch.
+# Python: uv brings its own CPython 3.12 (HAL requires >=3.12) — the OS python is not used.
+install_hal_device_decl() {
+  # Our device declaration. Prefer the repo checkout next to this script; fall back to raw GitHub.
+  local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  mkdir -p "$HAL_DEVICES_DIR/$HAL_DEVICE_TYPE"
+  local f
+  for f in DEVICE.md SAFETY.md presets.json; do
+    if [ -f "$script_dir/devices/$HAL_DEVICE_TYPE/$f" ]; then
+      cp "$script_dir/devices/$HAL_DEVICE_TYPE/$f" "$HAL_DEVICES_DIR/$HAL_DEVICE_TYPE/$f"
+    else
+      curl -fsSL "$INTERN_REPO_RAW/devices/$HAL_DEVICE_TYPE/$f" \
+        -o "$HAL_DEVICES_DIR/$HAL_DEVICE_TYPE/$f" \
+        || { echo "[stage] ERROR: cannot install device declaration $f"; return 1; }
+    fi
+  done
+}
+
+stage_hal() {
+  echo "[stage] HAL (autonomous-os os/hal @ ${AUTONOMOUS_OS_REF:0:9}) — open LED path on :5001"
+
+  # 1. uv — installs its own CPython 3.12 + the venv. Pinned installer endpoint.
+  if ! command -v uv >/dev/null 2>&1; then
+    curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh \
+      || { echo "[stage] ERROR: uv install failed"; return 1; }
+  fi
+
+  # 2. Pinned upstream checkout. Shallow fetch of the exact ref (same discipline as Hermes).
+  if [ ! -d /opt/autonomous-os/.git ]; then
+    git clone --filter=blob:none --no-checkout "$AUTONOMOUS_OS_REPO" /opt/autonomous-os
+  fi
+  git -C /opt/autonomous-os fetch --depth 1 origin "$AUTONOMOUS_OS_REF"
+  git -C /opt/autonomous-os checkout -f "$AUTONOMOUS_OS_REF"
+
+  # 3. Sync os/hal -> /opt/hal, preserving the env file and the venv across re-runs.
+  mkdir -p "$HAL_DIR"
+  rsync -a --delete --exclude '.env' --exclude '.venv' /opt/autonomous-os/os/hal/ "$HAL_DIR/"
+
+  # 4. Device declaration + env. HAL mounts only what DEVICE.md declares; with no ALSA
+  # config on this box the optional audio capability is skipped cleanly at boot.
+  install_hal_device_decl || return 1
+  if [ ! -f "$HAL_DIR/.env" ]; then
+    cat >"$HAL_DIR/.env" <<EOF
+HAL_MODE=production
+HAL_LOG_LEVEL=INFO
+DEVICE_TYPE=$HAL_DEVICE_TYPE
+DEVICES_DIR=$HAL_DEVICES_DIR
+OMP_NUM_THREADS=1
+OPENBLAS_NUM_THREADS=1
+EOF
+  fi
+
+  # 5. Build deps the sdist packages need (pyaudio wants portaudio.h — its absence
+  # killed the first live run of this stage; list mirrors upstream's imager chroot).
+  apt install -y build-essential portaudio19-dev libportaudio2 libasound2-dev alsa-utils
+
+  # 6. Full dependency sync (the upstream-canonical invocation; --extra hardware brings
+  # spidev/rpi-ws281x). First run is big (torch via ultralytics, opencv) — budget 20-40
+  # min and a few GB; later runs are no-ops. This is the "full HAL suite": vision/audio
+  # deps install now so those capabilities mount the day the hardware shows up.
+  ( cd "$HAL_DIR" && uv sync --python 3.12 --extra hardware ) \
+    || { echo "[stage] ERROR: uv sync failed — HAL not installed"; return 1; }
+
+  # 6b. webrtcvad ships a bare pkg_resources import that Python 3.12+ removed; upstream
+  # rewrites the module header in place after every sync. Same patch, python-applied.
+  local wvad
+  wvad=$(find "$HAL_DIR/.venv" -name "webrtcvad.py" -path "*/site-packages/*" 2>/dev/null | head -1 || true)
+  if [ -n "$wvad" ] && grep -q "^import pkg_resources" "$wvad" 2>/dev/null; then
+    python3 - "$wvad" <<'PYPATCH' || echo "[stage] WARN: webrtcvad patch failed (VAD may not import on 3.12)"
+import sys
+p = sys.argv[1]
+src = open(p).read()
+old = "import pkg_resources\n__version__ = pkg_resources.get_distribution('webrtcvad').version"
+new = ("try:\n    import pkg_resources\n"
+       "    __version__ = pkg_resources.get_distribution('webrtcvad').version\n"
+       "except Exception:\n    __version__ = '2.0.10'")
+if old in src:
+    open(p, "w").write(src.replace(old, new))
+    print("[stage] webrtcvad patched for Python 3.12+")
+else:
+    sys.exit(1)
+PYPATCH
+  fi
+
+  # 7. Unit. Upstream's, plus loopback-only is inherent (--host 127.0.0.1) and journald
+  # identifiers match our other services. --timeout-graceful-shutdown per upstream: an
+  # SSE stream otherwise holds SIGTERM until systemd's 90s SIGKILL.
+  cat >/etc/systemd/system/hal.service <<EOF
+[Unit]
+Description=HAL Hardware Runtime (autonomous-os os/hal)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$HAL_DIR
+Environment="PYTHONPATH=/opt"
+ExecStart=$HAL_DIR/.venv/bin/uvicorn hal.server:app --host 127.0.0.1 --port 5001 --timeout-graceful-shutdown 5
+TimeoutStopSec=30
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+
+  if [ "${1:-}" = "defer-start" ]; then
+    echo "[stage] AP onboarding pending — HAL installed but NOT started (intern-server keeps"
+    echo "[stage] the wizard + SPI until onboarding completes; re-run setup after to switch)."
+    systemctl disable hal.service 2>/dev/null || true
+    return 0
+  fi
+
+  # 7. SPI handover: stop the old owners FIRST (two SPI writers = garbage frames).
+  systemctl disable --now intern.service 2>/dev/null || true
+  systemctl disable --now intern-gateway-shim.service 2>/dev/null || true
+  systemctl enable --now hal.service
+
+  # 8. Health gate: HAL must answer and the light capability must be mounted.
+  local i ok=0
+  for i in $(seq 1 30); do
+    if curl -fsS -m 2 http://127.0.0.1:5001/health >/dev/null 2>&1; then ok=1; break; fi
+    sleep 2
+  done
+  if [ "$ok" != "1" ]; then
+    echo "[stage] ERROR: HAL /health never came up — rolling back to intern-server"
+    systemctl disable --now hal.service 2>/dev/null || true
+    systemctl enable --now intern-gateway-shim.service intern.service 2>/dev/null || true
+    return 1
+  fi
+  # Paint idle so the handover is visible on the ring.
+  curl -fsS -m 3 -X POST -H "Content-Type: application/json" \
+    -d '{"effect":"breathing","color":[0,6,12],"speed":4.0}' \
+    http://127.0.0.1:5001/led/effect >/dev/null 2>&1 || true
+  echo "[stage] HAL healthy on :5001 — intern-server + gateway shim retired"
+}
+
+# ----------------------------------------------------------
+# Hermes presync — the OS-owned config layer, re-asserted on every boot
+# ----------------------------------------------------------
+# Pattern from autonomous-os (internal/hermes/presync.sh + onboarding.go): anything the
+# OS owns in Hermes' state must be re-materialized idempotently, not injected once.
+# Before this, our re-runs preserved config.yaml wholesale, so a shipped fix never
+# reached an already-provisioned device and a bad edit never healed. The presync owns:
+#   - approvals.mode: "off"  (device runs unattended; channels can't answer approval
+#     cards. Value MUST be a quoted string: bare `off` is boolean False under PyYAML
+#     and the setting silently no-ops — upstream hit exactly this)
+#   - the hooks block (LED bridge wiring) if a preserved config lacks it
+#   - a non-empty timezone
+#   - the SOUL.md marker block (strip + re-append, atomic rename — updatable wording)
+#   - the ~/.hermes/hooks/intern-led-observer gateway hook (materialized write-if-changed)
+# Line-based edits on purpose: a YAML round-trip would strip the config's inline comments.
+# Wired as ExecStartPre= on hermes-gateway AND run by setup.sh (which restarts on change).
+stage_hermes_presync() {
+  echo "[stage] Hermes presync (self-healing OS config layer)"
+
+  cat >/usr/local/bin/intern-hermes-presync <<'PRESYNC'
+#!/usr/bin/env python3
+"""intern-hermes-presync — re-assert the OS-owned layer of Hermes state.
+
+Exit code 0 always (a broken presync must never block the gateway).
+Prints CHANGED or UNCHANGED so callers can decide whether to restart.
+"""
+import hashlib
+import os
+import sys
+
+HERMES = "/root/.hermes"
+CONFIG = f"{HERMES}/config.yaml"
+SOUL = f"{HERMES}/SOUL.md"
+HOOK_DIR = f"{HERMES}/hooks/intern-led-observer"
+
+MARK_BEGIN = "<!-- INTERN OS BLOCK — DO NOT REMOVE (rewritten by intern-hermes-presync) -->"
+MARK_END = "<!-- /INTERN OS BLOCK -->"
+
+SOUL_BLOCK = f"""{MARK_BEGIN}
+## Device skills (OS-managed)
+Skills installed under ~/.hermes/skills/ (led-control, scene, quiet-mode, mood, habit,
+wellbeing) are this device's own abilities and OUTRANK same-named bundled skills.
+The LED ring and any future hardware are driven via the HAL: http://127.0.0.1:5001
+(curl, JSON bodies). Quiet hours and brightness ceilings are enforced by the HAL
+itself; do not try to work around a dimmed ring at night.
+Before proactive messages (nudges, reminders), check /root/.hermes/intern-data/quiet-mode.json
+and stay silent while it is active, unless the matter is urgent.
+{MARK_END}"""
+
+HOOKS_BLOCK = """hooks_auto_accept: true
+hooks:
+  on_session_start:
+    - command: /usr/local/bin/intern-led-from-hermes
+      timeout: 5
+  pre_llm_call:
+    - command: /usr/local/bin/intern-led-from-hermes
+      timeout: 5
+  post_llm_call:
+    - command: /usr/local/bin/intern-led-from-hermes
+      timeout: 5
+  pre_tool_call:
+    - matcher: ".*"
+      command: /usr/local/bin/intern-led-from-hermes
+      timeout: 5
+  post_tool_call:
+    - matcher: ".*"
+      command: /usr/local/bin/intern-led-from-hermes
+      timeout: 5
+  on_session_end:
+    - command: /usr/local/bin/intern-led-from-hermes
+      timeout: 5
+"""
+
+HOOK_YAML = """name: intern-led-observer
+description: Ring ack-flash on message arrival and error pulse on failed turns, per channel.
+events:
+  - agent:start
+  - agent:end
+"""
+
+HOOK_HANDLER = '''"""intern-led-observer — message-level LED cues the config.yaml lifecycle hooks can't see.
+
+agent:start fires the moment a channel message enters the shared pipeline (before the
+LLM): flash the ring as an ack. agent:end with an error pulses red. The turn-level
+thinking/working states stay with the config.yaml hooks (finer granularity there).
+Contract per gateway/hooks.py: top-level handle(event_type, context), errors swallowed.
+"""
+import json
+import urllib.request
+
+HAL = "http://127.0.0.1:5001"
+
+
+def _post(path, body):
+    try:
+        req = urllib.request.Request(
+            HAL + path, data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=2).close()
+    except Exception:
+        pass  # best-effort: a down HAL must never slow a turn
+
+
+def handle(event_type, context):
+    if event_type == "agent:start":
+        _post("/led/status", {"state": "ready_flash"})
+    elif event_type == "agent:end" and context.get("error"):
+        _post("/led/status", {"state": "error"})
+'''
+
+
+def is_top(line):
+    return line and not line[0].isspace() and not line.lstrip().startswith("#") and ":" in line
+
+
+def fix_config(text):
+    """approvals.mode -> "off"; ensure hooks block; ensure timezone. Line-based."""
+    lines = text.split("\n")
+    out, i, n = [], 0, len(lines)
+    changed = False
+    has_hooks = any(is_top(l) and l.split(":", 1)[0].strip() == "hooks" for l in lines)
+    while i < n:
+        l = lines[i]
+        if is_top(l):
+            key = l.split(":", 1)[0].strip()
+            if key == "approvals":
+                out.append(l); i += 1
+                while i < n and (lines[i] == "" or lines[i][0].isspace()):
+                    s = lines[i].strip()
+                    if s.startswith("mode:") and not s.startswith("#"):
+                        if lines[i] != '  mode: "off"':
+                            out.append('  mode: "off"'); changed = True
+                        else:
+                            out.append(lines[i])
+                    else:
+                        out.append(lines[i])
+                    i += 1
+                continue
+            if key == "timezone":
+                val = l.split(":", 1)[1].strip().strip("'\"")
+                if not val:
+                    out.append("timezone: 'America/Los_Angeles'"); changed = True; i += 1
+                    continue
+        out.append(l); i += 1
+    if not has_hooks:
+        if out and out[-1] != "":
+            out.append("")
+        out.append(HOOKS_BLOCK.rstrip("\n"))
+        changed = True
+    return "\n".join(out), changed
+
+
+def upsert_soul(text):
+    lines = text.split("\n")
+    if MARK_BEGIN in text and MARK_END in text:
+        a = next(i for i, l in enumerate(lines) if MARK_BEGIN in l)
+        b = next(i for i, l in enumerate(lines) if MARK_END in l)
+        kept = lines[:a] + lines[b + 1:]
+    else:
+        kept = lines
+    while kept and kept[-1] == "":
+        kept.pop()
+    new = "\n".join(kept) + "\n\n" + SOUL_BLOCK + "\n"
+    return new, new != text
+
+
+def write_if_changed(path, content, mode=0o644):
+    old = None
+    if os.path.exists(path):
+        with open(path) as f:
+            old = f.read()
+    if old == content:
+        return False
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp, "w") as f:
+        f.write(content)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    return True
+
+
+def main():
+    changed = False
+    try:
+        if os.path.exists(CONFIG):
+            with open(CONFIG) as f:
+                text = f.read()
+            new, c = fix_config(text)
+            if c:
+                tmp = CONFIG + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(new)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, CONFIG)
+                changed = True
+        if os.path.exists(SOUL):
+            with open(SOUL) as f:
+                soul = f.read()
+            new, c = upsert_soul(soul)
+            if c:
+                tmp = SOUL + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(new)
+                os.replace(tmp, SOUL)
+                changed = True
+        changed |= write_if_changed(f"{HOOK_DIR}/HOOK.yaml", HOOK_YAML)
+        changed |= write_if_changed(f"{HOOK_DIR}/handler.py", HOOK_HANDLER)
+    except Exception as e:
+        print(f"presync error (non-fatal): {e}", file=sys.stderr)
+    print("CHANGED" if changed else "UNCHANGED")
+
+
+if __name__ == "__main__":
+    main()
+PRESYNC
+  chmod +x /usr/local/bin/intern-hermes-presync
+
+  # ExecStartPre: every gateway start gets the current OS layer (materialize only —
+  # the restart-on-change decision belongs to callers that aren't already starting).
+  mkdir -p /etc/systemd/system/hermes-gateway.service.d
+  cat >/etc/systemd/system/hermes-gateway.service.d/intern-presync.conf <<'EOF'
+[Service]
+ExecStartPre=-/usr/local/bin/intern-hermes-presync
+EOF
+  systemctl daemon-reload
+
+  local result
+  result=$(/usr/local/bin/intern-hermes-presync)
+  if [ "$result" = "CHANGED" ] && systemctl is-active --quiet hermes-gateway; then
+    echo "[stage] presync changed Hermes state — restarting gateway"
+    systemctl restart hermes-gateway
+  else
+    echo "[stage] presync: $result"
+  fi
+
+  # Agent-down sentinel: the ring must not freeze on the last hook state when the
+  # gateway dies. A tiny loop service: 3 consecutive is-active failures -> cyan
+  # agent_down status; recovery -> restore + idle. (Pattern: their health.go poller.)
+  cat >/usr/local/bin/intern-hermes-health <<'EOF'
+#!/usr/bin/env bash
+# Poll hermes-gateway; reflect agent-down on the ring via HAL status presets.
+HAL=http://127.0.0.1:5001
+fails=0 down=0
+while true; do
+  if systemctl is-active --quiet hermes-gateway; then
+    if [ "$down" = "1" ]; then
+      curl -fsS -m 2 -X POST -H "Content-Type: application/json" \
+        -d '{"effect":"breathing","color":[0,6,12],"speed":4.0}' "$HAL/led/effect" >/dev/null 2>&1
+      down=0
+    fi
+    fails=0
+  else
+    fails=$((fails+1))
+    if [ "$fails" -ge 3 ] && [ "$down" = "0" ]; then
+      curl -fsS -m 2 -X POST -H "Content-Type: application/json" \
+        -d '{"state":"agent_down"}' "$HAL/led/status" >/dev/null 2>&1
+      down=1
+    fi
+  fi
+  sleep 10
+done
+EOF
+  chmod +x /usr/local/bin/intern-hermes-health
+  cat >/etc/systemd/system/intern-hermes-health.service <<'EOF'
+[Unit]
+Description=Reflect hermes-gateway liveness on the LED ring
+After=hal.service
+
+[Service]
+ExecStart=/usr/local/bin/intern-hermes-health
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now intern-hermes-health.service
+}
+
+# ----------------------------------------------------------
+# Skills — first-party Autonomous skills, adapted for this stack
+# ----------------------------------------------------------
+# Copied from this repo's skills/ (adapted from autonomous-ai/autonomous-os: [HW:] reply
+# markers rewritten as curl to the HAL, camera/audio flows dropped). Installed dirs are
+# OURS to overwrite; anything else under ~/.hermes/skills/ is left alone.
+stage_skills() {
+  echo "[stage] Device skills -> $HERMES_HOME_DIR/skills/"
+  local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local src="$script_dir/skills"
+  if [ ! -d "$src" ]; then
+    echo "[stage] no local skills/ dir (running outside a checkout) — skipping"
+    return 0
+  fi
+  mkdir -p "$HERMES_HOME_DIR/skills" /root/.hermes/intern-data
+  local d name
+  for d in "$src"/*/; do
+    [ -f "$d/SKILL.md" ] || continue
+    name=$(basename "$d")
+    rsync -a --delete "$d" "$HERMES_HOME_DIR/skills/$name/"
+  done
+  echo "[stage] skills installed: $(ls -m "$src" | tr -d '\n')"
+}
+
+# ----------------------------------------------------------
+# SD endurance — journald cap + tmpfs /tmp
+# ----------------------------------------------------------
+# Journald with no cap will eat an SD card over months. (Pattern from their imager;
+# we skip their noatime remount — editing the live root fstab line isn't worth the risk.)
+stage_sd_endurance() {
+  echo "[stage] SD endurance (journald 100M cap, tmpfs /tmp)"
+  mkdir -p /etc/systemd/journald.conf.d
+  cat >/etc/systemd/journald.conf.d/intern-cap.conf <<'EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=100M
+EOF
+  systemctl restart systemd-journald
+  if ! grep -qE '^\S+\s+/tmp\s+tmpfs' /etc/fstab; then
+    echo 'tmpfs /tmp tmpfs defaults,nosuid,nodev,size=256M 0 0' >>/etc/fstab
+    echo "[stage] tmpfs /tmp added to fstab (applies on next boot — not mounted live:"
+    echo "[stage] shadowing a populated /tmp under running services isn't worth it)"
   fi
 }
 
@@ -2114,6 +2630,12 @@ case "\$APP" in
 esac
 
 if [ "\$APP" = "hermes" ]; then
+  # Rollback net: record what we're on and snapshot the config before touching anything.
+  # After the update, the gateway must go active within 60s or we revert wholesale.
+  # (Upstream's component OTA has no rollback at all; this exceeds it on purpose.)
+  HSRC=/usr/local/lib/hermes-agent
+  PREV_REF=\$(git -C "\$HSRC" rev-parse HEAD 2>/dev/null || echo "")
+  cp -a /root/.hermes/config.yaml "/root/.hermes/config.yaml.pre-update" 2>/dev/null || true
   # Pinned to the tag this image was provisioned with; edit to move off it.
   # Process substitution on purpose — 'curl | bash < /dev/null' silently no-ops.
   HERMES_HOME=/root/.hermes DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
@@ -2122,7 +2644,6 @@ if [ "\$APP" = "hermes" ]; then
   # A reinstall can replace the dashboard dist. The dashboard service runs --skip-build, so a
   # missing dist means it crash-loops ("no web dist found") — the exact first-provision bug,
   # reintroduced through the update path. Rebuild if needed and re-inject the R1 tile.
-  HSRC=/usr/local/lib/hermes-agent
   if [ -f "\$HSRC/web/package.json" ] && [ ! -f "\$HSRC/hermes_cli/web_dist/index.html" ]; then
     echo "Rebuilding dashboard web dist (can take a few minutes on a Pi)..."
     ( cd "\$HSRC/web" \
@@ -2132,6 +2653,25 @@ if [ "\$APP" = "hermes" ]; then
   fi
   [ -x /usr/local/bin/intern-dashboard-r1-patch ] && /usr/local/bin/intern-dashboard-r1-patch || true
   systemctl restart hermes-gateway hermes-dashboard
+  # Health gate: active-and-staying-active within 60s, or revert to the recorded ref.
+  ok=0
+  for i in \$(seq 1 12); do
+    sleep 5
+    systemctl is-active --quiet hermes-gateway && ok=\$((ok+1)) || ok=0
+    [ "\$ok" -ge 3 ] && break
+  done
+  if [ "\$ok" -lt 3 ]; then
+    if [ -n "\$PREV_REF" ]; then
+      echo "hermes update FAILED health check — reverting to \${PREV_REF:0:9}" >&2
+      git -C "\$HSRC" checkout -f "\$PREV_REF" || true
+      "\$HSRC/venv/bin/pip" install -e "\$HSRC" --no-deps -q || true
+      cp -a /root/.hermes/config.yaml.pre-update /root/.hermes/config.yaml 2>/dev/null || true
+      systemctl restart hermes-gateway hermes-dashboard
+      exit 1
+    fi
+    echo "hermes update failed health check and no previous ref recorded" >&2
+    exit 1
+  fi
   echo "hermes updated (${HERMES_BRANCH})"
   exit 0
 fi
@@ -2266,7 +2806,12 @@ tar czf "\$OUT" \\
   --exclude='.hermes/logs' \\
   --exclude='.hermes/plugins/*/.git' \\
   --exclude='*__pycache__*' \\
+  --exclude='.hermes/response_store.db*' \\
+  --exclude='*.db-wal' \\
+  --exclude='*.db-shm' \\
   -C /root \$members || [ \$? -eq 1 ]
+# response_store.db is a rebuildable cache upstream has measured at 1.9GB on a bloated
+# device — one bad store would make every rotated tarball multi-GB and fill the SD.
 # Rotate: newest KEEP stay.
 ls -1t "\$OUT_DIR"/intern-*.tar.gz 2>/dev/null | tail -n +\$((KEEP+1)) | xargs -r rm -f
 if [ -n "\$REMOTE" ]; then
@@ -2333,6 +2878,30 @@ else
   echo "[main] AP_MODE=$AP_MODE -> keeping existing Wi-Fi (no AP); device is already online"
 fi
 
+# HAL after the AP decision: on the AP path intern-server keeps the wizard + SPI until
+# onboarding completes (HAL installs but doesn't start); otherwise HAL takes over and
+# intern-server + the gateway shim retire.
+# run_stage: `set -e` is suspended inside an `if` condition, so a stage failure lands
+# here as a recorded exit code instead of silently killing the run — the 2026-07-16
+# uv-sync failure aborted everything after it, including the QC that would have said so.
+FAILED_STAGES=""
+run_stage() {
+  local name="$1"; shift
+  if "$name" "$@"; then
+    return 0
+  fi
+  echo "[main] !!!! $name FAILED (exit $?) — continuing; QC will report it"
+  FAILED_STAGES="$FAILED_STAGES $name"
+}
+if [ "$AP_DECISION" = "ap" ]; then
+  run_stage stage_hal defer-start
+else
+  run_stage stage_hal
+fi
+run_stage stage_hermes_presync
+run_stage stage_skills
+run_stage stage_sd_endurance
+
 # Firewall locks the dashboard + SSH to the tailnet. Don't lock ourselves out: in the
 # no-AP path the only ways in are loopback + Tailscale, so require Tailscale to be up.
 if [ "${SKIP_FIREWALL:-0}" = "1" ]; then
@@ -2365,6 +2934,51 @@ else
   echo "[main] Wi-Fi already configured — keeping the existing connection and skipping the AP/"
   echo "       captive-portal onboarding. wlan0 stays NetworkManager-managed and online."
   echo "       (AP helper scripts are not installed in this path; re-run with AP_MODE=force to enable them.)"
+fi
+
+# Provenance stamp: "what exactly is this card running" answerable over SSH months later.
+SCRIPT_SHA="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse HEAD 2>/dev/null || echo unknown)"
+cat >/etc/intern-build.json <<EOF
+{
+  "provisioned_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "setup_git_sha": "$SCRIPT_SHA",
+  "hermes_branch": "$HERMES_BRANCH",
+  "hermes_ref": "$HERMES_REF",
+  "autonomous_os_ref": "$AUTONOMOUS_OS_REF",
+  "device_type": "$HAL_DEVICE_TYPE",
+  "ap_path": "$([ "$AP_DECISION" = "ap" ] && echo true || echo false)"
+}
+EOF
+
+# QC gate: "setup finished" only counts if it VERIFIED (pattern: their imager's
+# end-of-build assertions). Non-fatal on the AP path where half the stack is deferred.
+QC_FAILS=""
+qc() { # qc <label> <command...>
+  if "${@:2}" >/dev/null 2>&1; then echo "  ok    $1"; else echo "  FAIL  $1"; QC_FAILS="$QC_FAILS $1"; fi
+}
+echo ""
+echo "[main] QC checks:"
+qc "caddy active"            systemctl is-active --quiet caddy
+qc "hermes-gateway active"   systemctl is-active --quiet hermes-gateway
+qc "hermes-dashboard active" systemctl is-active --quiet hermes-dashboard
+qc "dashboard answers"       curl -fsS -m 5 -o /dev/null http://127.0.0.1:9119/
+qc "backup timer"            systemctl is-active --quiet intern-backup.timer
+qc "power monitor timer"     systemctl is-active --quiet intern-power-monitor.timer
+if [ "$AP_DECISION" != "ap" ]; then
+  qc "hal active"            systemctl is-active --quiet hal.service
+  qc "hal /health"           curl -fsS -m 5 -o /dev/null http://127.0.0.1:5001/health
+  qc "hermes-health sentinel" systemctl is-active --quiet intern-hermes-health.service
+  qc "intern-server retired" bash -c '! systemctl is-active --quiet intern.service'
+  qc "gateway shim retired"  bash -c '! systemctl is-active --quiet intern-gateway-shim.service'
+fi
+if [ -n "${FAILED_STAGES:-}" ]; then
+  echo "[main] QC: stages that failed earlier:$FAILED_STAGES"
+fi
+if [ -n "$QC_FAILS" ] || [ -n "${FAILED_STAGES:-}" ]; then
+  echo "[main] QC FAILED:$QC_FAILS"
+  echo "[main] setup completed WITH FAILURES — inspect the units above before trusting the box."
+else
+  echo "[main] QC: all checks passed."
 fi
 
 TS_NAME="${TS_HOSTNAME:-intern-$(serial_suffix)}"
