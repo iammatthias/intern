@@ -1053,13 +1053,15 @@ YAML
 # Map a Hermes lifecycle hook (JSON on stdin) to a HAL LED look and POST it.
 # Always print {} so the hook never blocks/rewrites the agent.
 ev=$(jq -r '.hook_event_name // empty' 2>/dev/null)
+# HAL "speed" is a rate multiplier (breathing cycle ~3s at 1.0), not a period:
+# higher = faster. Idle must stay well under 1.0 or the ring visibly flashes.
 case "$ev" in
   pre_llm_call|on_session_start|post_tool_call|subagent_stop)
     body='{"effect":"breathing","color":[0,156,199],"speed":1.5}' ;;   # thinking — cyan
   pre_tool_call)
     body='{"effect":"pulse","color":[0,108,204],"speed":0.8}' ;;       # working — blue
   post_llm_call|on_session_end|on_session_finalize|on_session_reset|*)
-    body='{"effect":"breathing","color":[0,6,12],"speed":4.0}' ;;      # idle — near-dark blue
+    body='{"effect":"breathing","color":[0,6,12],"speed":0.3}' ;;      # idle — near-dark blue
 esac
 curl -fsS -m 3 -X POST -H "Content-Type: application/json" \
   -d "$body" http://127.0.0.1:5001/led/effect >/dev/null 2>&1 || true
@@ -1859,7 +1861,7 @@ EOF
   fi
   # Paint idle so the handover is visible on the ring.
   curl -fsS -m 3 -X POST -H "Content-Type: application/json" \
-    -d '{"effect":"breathing","color":[0,6,12],"speed":4.0}' \
+    -d '{"effect":"breathing","color":[0,6,12],"speed":0.3}' \
     http://127.0.0.1:5001/led/effect >/dev/null 2>&1 || true
   echo "[stage] HAL healthy on :5001 — intern-server + gateway shim retired"
 }
@@ -2112,7 +2114,7 @@ while true; do
   if systemctl is-active --quiet hermes-gateway; then
     if [ "$down" = "1" ]; then
       curl -fsS -m 2 -X POST -H "Content-Type: application/json" \
-        -d '{"effect":"breathing","color":[0,6,12],"speed":4.0}' "$HAL/led/effect" >/dev/null 2>&1
+        -d '{"effect":"breathing","color":[0,6,12],"speed":0.3}' "$HAL/led/effect" >/dev/null 2>&1
       down=0
     fi
     fails=0
