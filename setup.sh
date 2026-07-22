@@ -63,8 +63,9 @@
 #                           SSH reachable over the LAN. Useful on a dev box you reach over the LAN.
 #   LAN_SSH_CIDR            With the firewall on, also allow SSH (port 22 only) from this home LAN
 #                           subnet — "auto" (detect the LAN /24) or a CIDR like 192.168.1.0/24.
-#                           Default unset = SSH stays tailnet-only. Dashboard/API ports always
-#                           stay tailnet-only regardless.
+#                           Default unset = SSH stays tailnet-only, EXCEPT a re-run keeps a CIDR a
+#                           previous run baked in (pass LAN_SSH_CIDR=none to drop it). Dashboard/API
+#                           ports always stay tailnet-only regardless.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -2109,6 +2110,15 @@ EOF
 #!/usr/bin/env bash
 # Poll hermes-gateway; reflect agent-down on the ring via HAL status presets.
 HAL=http://127.0.0.1:5001
+# Boot paint: nothing else touches the ring after a reboot (hooks only fire on agent
+# activity), so without this the ring sits dark until the first message. Wait for HAL,
+# then paint idle once.
+for _ in $(seq 1 30); do
+  curl -fsS -m 2 "$HAL/health" >/dev/null 2>&1 && break
+  sleep 2
+done
+curl -fsS -m 2 -X POST -H "Content-Type: application/json" \
+  -d '{"effect":"breathing","color":[0,6,12],"speed":0.3}' "$HAL/led/effect" >/dev/null 2>&1
 fails=0 down=0
 while true; do
   if systemctl is-active --quiet hermes-gateway; then
@@ -2200,6 +2210,12 @@ EOF
 stage_firewall() {
   echo "[stage] Firewall (tailnet-only dashboard + SSH)"
 
+  # Read the CIDR a previous run baked in BEFORE the heredoc overwrites the script. A re-run
+  # without LAN_SSH_CIDR in env must not silently wipe the opt-in (that wipe stays invisible
+  # until the next boot rebuilds the chain, and then LAN SSH is gone).
+  local prev_cidr=""
+  prev_cidr="$(grep -m1 '^LAN_SSH_CIDR="' /usr/local/bin/intern-firewall 2>/dev/null | cut -d'"' -f2 || true)"
+
   cat >/usr/local/bin/intern-firewall <<'EOF'
 #!/bin/bash
 # Restrict admin/dashboard ports to loopback, the tailnet, and the AP onboarding subnet.
@@ -2244,6 +2260,11 @@ EOF
     [ -n "$lan_ssh" ] && echo "[stage] LAN_SSH_CIDR=auto -> $lan_ssh" \
       || echo "[stage] WARN: LAN_SSH_CIDR=auto couldn't detect a LAN subnet; SSH stays tailnet-only"
   fi
+  if [ -z "$lan_ssh" ] && [ -n "$prev_cidr" ] && [ "$prev_cidr" != "__LAN_SSH_CIDR__" ]; then
+    lan_ssh="$prev_cidr"
+    echo "[stage] LAN_SSH_CIDR: keeping previously applied $lan_ssh (pass LAN_SSH_CIDR=none to drop)"
+  fi
+  [ "$lan_ssh" = "none" ] && lan_ssh=""
   sed -i "s|__LAN_SSH_CIDR__|${lan_ssh}|" /usr/local/bin/intern-firewall
   chmod +x /usr/local/bin/intern-firewall
 
@@ -2264,11 +2285,12 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  # enable --now both runs the oneshot (which applies the rules via ExecStart) AND marks the
-  # service active(exited), so `systemctl is-active intern-firewall` reflects reality. Running
-  # the binary directly + only enabling left the service "inactive" until the next boot even
-  # though the rules were applied. Idempotent: the chain is rebuilt on each run.
-  systemctl enable --now intern-firewall.service
+  # restart, not `enable --now`: starting an already-active(exited) oneshot is a NO-OP, so on
+  # re-runs `--now` would leave the OLD rules live while the rewritten script waits for the
+  # next boot — exactly the runtime/persisted drift this stage must not create. restart always
+  # re-executes ExecStart; enable keeps it applying at boot. Idempotent: chain rebuilt each run.
+  systemctl enable intern-firewall.service
+  systemctl restart intern-firewall.service
   echo "[stage] NOTE: new LAN connections to 22/80 are now dropped; use the tailnet (or the AP) instead."
 }
 
