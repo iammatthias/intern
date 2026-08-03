@@ -25,7 +25,7 @@
 #   TS_AUTHKEY              Tailscale auth key for unattended join (else: run `tailscale up` later)
 #   TS_HOSTNAME             Tailnet hostname (default: intern-<serial suffix>)
 #   HERMES_BRANCH           Branch/tag the installer clones (default: main)
-#   HERMES_REF              Commit to pin after clone (default: a v0.18.0-era main commit;
+#   HERMES_REF              Commit to pin after clone (default: a v0.20.0-era main commit;
 #                           set "" to track HERMES_BRANCH HEAD)
 #   OPENROUTER_API_KEY      Hermes LLM key for the unpaired/BYO path
 #   HERMES_MODEL            Optionally pin the default chat model (default: unset — pick it in
@@ -117,7 +117,7 @@ HERMES_HOME_DIR="/root/.hermes"
 # origin/main. Set HERMES_REF="" to ride main HEAD, bump it to a newer commit, or move to a tag
 # (HERMES_BRANCH=v<tag>, HERMES_REF="") once tags catch up with what we're tracking.
 HERMES_BRANCH="${HERMES_BRANCH:-main}"
-HERMES_REF="${HERMES_REF:-42bd4368aef12be890a74b749ae04d009c0a4412}"
+HERMES_REF="${HERMES_REF:-a991dfc25daf68994c21d6adcdfbafb1b3dc23cf}"
 # Pairing-time device config (LLM key/model/base_url, channel tokens, active_agent)
 DEVICE_CONFIG="/root/config/config.json"
 # Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own OpenRouter.
