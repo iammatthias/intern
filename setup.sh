@@ -117,7 +117,7 @@ HERMES_HOME_DIR="/root/.hermes"
 # origin/main. Set HERMES_REF="" to ride main HEAD, bump it to a newer commit, or move to a tag
 # (HERMES_BRANCH=v<tag>, HERMES_REF="") once tags catch up with what we're tracking.
 HERMES_BRANCH="${HERMES_BRANCH:-main}"
-HERMES_REF="${HERMES_REF:-a991dfc25daf68994c21d6adcdfbafb1b3dc23cf}"
+HERMES_REF="${HERMES_REF:-2cdb30a474d76cca9eb61714d889c18f493aa7fc}"
 # Pairing-time device config (LLM key/model/base_url, channel tokens, active_agent)
 DEVICE_CONFIG="/root/config/config.json"
 # Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own OpenRouter.
