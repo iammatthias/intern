@@ -1883,6 +1883,44 @@ EOF
 #   - the ~/.hermes/hooks/intern-led-observer gateway hook (materialized write-if-changed)
 # Line-based edits on purpose: a YAML round-trip would strip the config's inline comments.
 # Wired as ExecStartPre= on hermes-gateway AND run by setup.sh (which restarts on change).
+stage_browser_web() {
+  echo "[stage] Browser + web search (agent-browser, chromium, ddgs, tirith)"
+
+  # Chromium: agent-browser has its own browser cache under /root/.agent-browser/browsers,
+  # but that cache starts EMPTY and it then falls back to system Chrome. Without a system
+  # chromium there is no engine at all, so this apt package is what actually drives the
+  # browser (`agent-browser doctor` reports "Falling back to system Chrome ... /usr/bin/chromium").
+  # Google ships no Chrome build for arm64 Linux; chromium is the Chromium-family browser here.
+  if ! command -v chromium >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chromium \
+      || echo "[stage] WARN: chromium install failed — browser tools will have no engine"
+  fi
+
+  # agent-browser drives the built-in browser_* tools. Ships prebuilt per-arch binaries
+  # (linux-arm64 here), so this is a fast install, not a source build.
+  local npath="/root/.hermes/node/bin:$PATH"
+  if ! command -v agent-browser >/dev/null 2>&1; then
+    if HOME=/root PATH="$npath" npm install -g agent-browser --no-audit --no-fund >/dev/null 2>&1; then
+      echo "[stage] agent-browser installed"
+    else
+      echo "[stage] WARN: agent-browser install failed — browser toolset will stay inert"
+    fi
+  fi
+
+  # ddgs is the ONLY web-search backend gated on a Python package rather than an API key
+  # (tools/web_tools.py::_ddgs_package_importable), so it is the one that gives a keyless
+  # device real web search. tirith is the prompt-injection scanner config.yaml already
+  # enables — without the binary it fails open and silently scans nothing.
+  local vpip="/usr/local/lib/hermes-agent/venv/bin/pip"
+  if [ -x "$vpip" ]; then
+    "$vpip" install -q ddgs tirith >/dev/null 2>&1 \
+      || echo "[stage] WARN: ddgs/tirith install failed — web search and/or tirith stay unavailable"
+  fi
+
+  command -v chromium >/dev/null 2>&1 && echo "[stage] chromium: $(chromium --version 2>/dev/null | head -1)"
+  command -v agent-browser >/dev/null 2>&1 && echo "[stage] agent-browser: $(agent-browser --version 2>/dev/null | head -1)"
+}
+
 stage_hermes_presync() {
   echo "[stage] Hermes presync (self-healing OS config layer)"
 
@@ -1982,28 +2020,87 @@ def is_top(line):
     return line and not line[0].isspace() and not line.lstrip().startswith("#") and ":" in line
 
 
+# Nested scalars this OS owns, as {top-level key: {child key: exact desired line}}.
+# YAML 1.1 GOTCHA: bare `off` parses as boolean False, so both approvals.mode and
+# browser.backend MUST stay quoted. Hermes documents this for browser.backend in
+# tools/browser_use_cli.py; approvals.mode has bitten this device before.
+#   browser.backend "off"  -> built-in browser_* tools. Leaving it UNSET is not the
+#     same thing: with uvx on PATH (it is, /usr/local/bin/uvx) Hermes would enable
+#     Browser Use mode instead, a downloaded harness that runs model-written Python.
+#   web.search_backend ddgs -> the only keyless search backend.
+#   security.tirith_path    -> absolute: the venv bin dir is NOT on the gateway's PATH,
+#     so the default bare `tirith` lookup fails and (fail_open) scans nothing silently.
+OWNED_SUBKEYS = {
+    "approvals": {"mode": '  mode: "off"'},
+    "browser": {"backend": '  backend: "off"'},
+    "web": {"search_backend": "  search_backend: 'ddgs'"},
+    "security": {"tirith_path": "  tirith_path: /usr/local/lib/hermes-agent/venv/bin/tirith"},
+    "updates": {"pre_update_backup": "  pre_update_backup: true"},
+    "sessions": {"auto_prune": "  auto_prune: true"},
+}
+
+
+def child_key(line):
+    """Key name when `line` is a DIRECT child (exactly two spaces of indent).
+
+    Depth matters: `security` has a nested `website_blocklist:` block, and a naive
+    strip().startswith() would rewrite keys belonging to that sub-block.
+    """
+    if not line.startswith("  ") or line[2:3].isspace():
+        return None
+    s = line.strip()
+    if s.startswith("#") or ":" not in s:
+        return None
+    return s.split(":", 1)[0].strip()
+
+
 def fix_config(text):
-    """approvals.mode -> "off"; ensure hooks block; ensure timezone. Line-based."""
+    """Re-assert the OS-owned config keys. Line-based, to keep inline comments."""
     lines = text.split("\n")
     out, i, n = [], 0, len(lines)
     changed = False
-    has_hooks = any(is_top(l) and l.split(":", 1)[0].strip() == "hooks" for l in lines)
+    tops = set()
+    for l in lines:
+        if is_top(l):
+            tops.add(l.split(":", 1)[0].strip())
     while i < n:
         l = lines[i]
         if is_top(l):
             key = l.split(":", 1)[0].strip()
-            if key == "approvals":
+            if key in OWNED_SUBKEYS:
+                wanted = OWNED_SUBKEYS[key]
                 out.append(l); i += 1
+                seen = set()
                 while i < n and (lines[i] == "" or lines[i][0].isspace()):
-                    s = lines[i].strip()
-                    if s.startswith("mode:") and not s.startswith("#"):
-                        if lines[i] != '  mode: "off"':
-                            out.append('  mode: "off"'); changed = True
+                    ck = child_key(lines[i])
+                    if ck in wanted:
+                        seen.add(ck)
+                        if lines[i] != wanted[ck]:
+                            out.append(wanted[ck]); changed = True
                         else:
                             out.append(lines[i])
                     else:
                         out.append(lines[i])
                     i += 1
+                missing = [wanted[k] for k in wanted if k not in seen]
+                if missing:
+                    # Children must land before the next top-level key.
+                    trailing = []
+                    while out and out[-1] == "":
+                        trailing.append(out.pop())
+                    out.extend(missing); out.extend(trailing); changed = True
+                continue
+            if key == "toolsets":
+                out.append(l); i += 1
+                block = []
+                while i < n and (lines[i] == "" or lines[i][0].isspace()):
+                    block.append(lines[i]); i += 1
+                if not any(b.strip() == "- browser" for b in block):
+                    trailing = []
+                    while block and block[-1] == "":
+                        trailing.append(block.pop())
+                    block.append("  - browser"); block.extend(trailing); changed = True
+                out.extend(block)
                 continue
             if key == "timezone":
                 val = l.split(":", 1)[1].strip().strip("'\"")
@@ -2011,7 +2108,20 @@ def fix_config(text):
                     out.append("timezone: 'America/Los_Angeles'"); changed = True; i += 1
                     continue
         out.append(l); i += 1
-    if not has_hooks:
+    # Whole blocks can be absent on a fresh config — add them rather than assume.
+    for key, wanted in OWNED_SUBKEYS.items():
+        if key not in tops:
+            if out and out[-1] != "":
+                out.append("")
+            out.append(key + ":")
+            out.extend(wanted.values())
+            changed = True
+    if "toolsets" not in tops:
+        if out and out[-1] != "":
+            out.append("")
+        out.extend(["toolsets:", "  - hermes-cli", "  - browser"])
+        changed = True
+    if "hooks" not in tops:
         if out and out[-1] != "":
             out.append("")
         out.append(HOOKS_BLOCK.rstrip("\n"))
@@ -2922,6 +3032,7 @@ if [ "$AP_DECISION" = "ap" ]; then
 else
   run_stage stage_hal
 fi
+run_stage stage_browser_web    # before presync: presync asserts the config keys these binaries back
 run_stage stage_hermes_presync
 run_stage stage_skills
 run_stage stage_sd_endurance
