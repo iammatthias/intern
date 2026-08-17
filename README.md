@@ -18,7 +18,7 @@ It's a reworked version of the stock [`setup.sh`](https://cdn.autonomous.ai/inte
 | **HAL** | Autonomous OS's open hardware layer ([autonomous-ai/autonomous-os](https://github.com/autonomous-ai/autonomous-os) `os/hal`, pinned commit, loopback `:5001`). Drives the WS2812 ring directly over spidev with per-frame safety clamps (brightness ceiling, quiet hours 22:00-07:00) from our `devices/intern-v1/SAFETY.md`. Replaces the closed intern-server LED path and the `:18789` gateway shim |
 | **Device contract** | `devices/intern-v1/` declares the hardware (light + system required, audio/sensing optional for future hardware); CI runs upstream's conformance suite against it |
 | **intern backend** | The Autonomous `intern-server`, now only for the captive-portal Wi-Fi onboarding API. Retired (stopped + disabled) once the device is online and HAL owns the ring |
-| **Hermes agent** | Gateway as a systemd service (`hermes-gateway`), pinned to a fixed upstream `main` commit (currently v0.20.0, the v2026.8.3 release) |
+| **Hermes agent** | Gateway as a systemd service (`hermes-gateway`), pinned to a fixed upstream `main` commit (currently v0.20.2, the v2026.8.16 release) |
 | **Presync** | `intern-hermes-presync` re-asserts the OS-owned Hermes state (approvals off, hooks block, SOUL.md block, gateway hook, browser/web/tirith keys, pre-update backup, session pruning) on every boot and setup re-run, restarting the gateway only on change |
 | **Browser + web search** | `agent-browser` (npm, prebuilt arm64) plus a system `chromium` give the agent the built-in `browser_*` tools, so it can open pages, click, and fill forms. `ddgs` in the Hermes venv backs `web_search` with no API key. `tirith` in the same venv makes the prompt-injection scanner real instead of failing open |
 | **Skills** | `skills/` (adapted from Autonomous OS first-party skills): led-control, scene, quiet-mode, mood, habit, wellbeing, installed into `~/.hermes/skills/` |
@@ -68,7 +68,7 @@ TS_AUTHKEY=tskey-... \
 | `TS_AUTHKEY` / `TS_HOSTNAME` | Tailscale unattended join and tailnet hostname (default `intern-<serial>`) |
 | `OPENROUTER_API_KEY` | LLM key for Hermes on the unpaired (bring-your-own) path |
 | `HERMES_MODEL` / `HERMES_FALLBACK_MODEL` | optional. Pin a chat model. Default is unset, so you pick it in the dashboard |
-| `HERMES_BRANCH` / `HERMES_REF` | Branch the installer clones (default `main`) and the commit it pins to (default: a v0.20.0-era `main` commit, what the live device runs). Set `HERMES_REF` empty to track the branch HEAD |
+| `HERMES_BRANCH` / `HERMES_REF` | Branch the installer clones (default `main`) and the commit it pins to (default: a v0.20.2-era `main` commit, what the live device runs). Set `HERMES_REF` empty to track the branch HEAD |
 | `AUTONOMOUS_OS_REF` | Commit of [autonomous-os](https://github.com/autonomous-ai/autonomous-os) the HAL installs from (pinned, same discipline as `HERMES_REF`) |
 | `HAL_DEVICE_TYPE` | Device declaration under `devices/` the HAL boots with (default `intern-v1`) |
 | `RABBIT_AGENT_TOKEN` | Rabbit R1 channel: node registration token from [rabbithole](https://hole.rabbit.tech) (Settings → Nodes → Register Node). One-time; re-runs don't need it |
