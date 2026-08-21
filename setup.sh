@@ -25,7 +25,7 @@
 #   TS_AUTHKEY              Tailscale auth key for unattended join (else: run `tailscale up` later)
 #   TS_HOSTNAME             Tailnet hostname (default: intern-<serial suffix>)
 #   HERMES_BRANCH           Branch/tag the installer clones (default: main)
-#   HERMES_REF              Commit to pin after clone (default: a v0.20.2-era main commit;
+#   HERMES_REF              Commit to pin after clone (default: a v0.20.4-era main commit;
 #                           set "" to track HERMES_BRANCH HEAD)
 #   OPENROUTER_API_KEY      Hermes LLM key for the unpaired/BYO path
 #   HERMES_MODEL            Optionally pin the default chat model (default: unset — pick it in
@@ -110,14 +110,14 @@ WEB_ROOT="/usr/share/caddy/setup"
 HERMES_HOME_DIR="/root/.hermes"
 # Hermes source pin. The installer clones HERMES_BRANCH (its `--branch` accepts a tag or a
 # branch); HERMES_REF optionally checks out a commit afterward for reproducibility. We track
-# `main` pinned to a commit — currently the v0.20.2 (v2026.8.16) release commit
-# (what the live device runs as of 2026-08-16). Cloning the `main` BRANCH
+# `main` pinned to a commit — currently a v0.20.4 (v2026.8.18) era main commit
+# (what the live device runs as of 2026-08-20). Cloning the `main` BRANCH
 # (not a tag) is ALSO what keeps the native `hermes update` working: a `--branch <tag>` clone is
 # single-branch with no origin/main, so `hermes update` can't switch to main; a main clone tracks
 # origin/main. Set HERMES_REF="" to ride main HEAD, bump it to a newer commit, or move to a tag
 # (HERMES_BRANCH=v<tag>, HERMES_REF="") once tags catch up with what we're tracking.
 HERMES_BRANCH="${HERMES_BRANCH:-main}"
-HERMES_REF="${HERMES_REF:-93ed11379b6a7203f87ca8a9cb3e4e33dda4e6a7}"
+HERMES_REF="${HERMES_REF:-40643cbaf9b767af146694131ffb8f8160f25e1c}"
 # Pairing-time device config (LLM key/model/base_url, channel tokens, active_agent)
 DEVICE_CONFIG="/root/config/config.json"
 # Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own OpenRouter.
