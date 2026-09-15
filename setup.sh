@@ -110,14 +110,14 @@ WEB_ROOT="/usr/share/caddy/setup"
 HERMES_HOME_DIR="/root/.hermes"
 # Hermes source pin. The installer clones HERMES_BRANCH (its `--branch` accepts a tag or a
 # branch); HERMES_REF optionally checks out a commit afterward for reproducibility. We track
-# `main` pinned to a commit — currently a v0.20.4 (v2026.8.18) era main commit
-# (what the live device runs as of 2026-08-20). Cloning the `main` BRANCH
+# `main` pinned to a commit — currently a v0.21.3 (v2026.9.14) era main commit
+# (what the live device runs as of 2026-09-15). Cloning the `main` BRANCH
 # (not a tag) is ALSO what keeps the native `hermes update` working: a `--branch <tag>` clone is
 # single-branch with no origin/main, so `hermes update` can't switch to main; a main clone tracks
 # origin/main. Set HERMES_REF="" to ride main HEAD, bump it to a newer commit, or move to a tag
 # (HERMES_BRANCH=v<tag>, HERMES_REF="") once tags catch up with what we're tracking.
 HERMES_BRANCH="${HERMES_BRANCH:-main}"
-HERMES_REF="${HERMES_REF:-40643cbaf9b767af146694131ffb8f8160f25e1c}"
+HERMES_REF="${HERMES_REF:-5910de20bc9839fdd36e791a9d72ba2c2e722f66}"
 # Pairing-time device config (LLM key/model/base_url, channel tokens, active_agent)
 DEVICE_CONFIG="/root/config/config.json"
 # Hermes LLM when the device is NOT paired with the Autonomous proxy: bring-your-own OpenRouter.
