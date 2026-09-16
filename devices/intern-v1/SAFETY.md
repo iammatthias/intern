@@ -9,7 +9,7 @@ light:
 
 # SAFETY.md: Autonomous Intern v1 (community stack)
 
-The bounds contract: `DEVICE.md` says what the body can do; this file says what it must
+The bounds contract: `ROBOT.md` says what the body can do; this file says what it must
 never do, enforced deterministically by the HAL, not by prompting the agent. v1 has no
 motion and no speaker, so the only governed capability is the LED ring.
 

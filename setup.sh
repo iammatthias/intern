@@ -171,7 +171,7 @@ R1_SHIM_REPO="${R1_SHIM_REPO:-iammatthias/r1-hermes-shim}"
 # single pixels no longer latch a wrong hue at low values), clear-strip-on-boot, the
 # breathing_fine effect and /led/paint gradients. NOTE: hal is GPL-3 (LeLamp fork) — it
 # is cloned from upstream at provision time, not vendored into this repo.
-# The device declaration (devices/intern-v1/{DEVICE.md,SAFETY.md,presets.json}) IS ours,
+# The device declaration (devices/intern-v1/{ROBOT.md,SAFETY.md,presets.json}) IS ours,
 # installed from this repo checkout (fallback: raw.githubusercontent).
 AUTONOMOUS_OS_REPO="${AUTONOMOUS_OS_REPO:-https://github.com/autonomous-ai/autonomous-os.git}"
 AUTONOMOUS_OS_REF="${AUTONOMOUS_OS_REF:-5a834bc7b7b4db446a3782c8ab46d64feb98e98c}"
@@ -1736,15 +1736,22 @@ install_hal_device_decl() {
   local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   mkdir -p "$HAL_DEVICES_DIR/$HAL_DEVICE_TYPE"
   local f
-  for f in DEVICE.md SAFETY.md presets.json; do
+  for f in ROBOT.md SAFETY.md presets.json; do
     if [ -f "$script_dir/devices/$HAL_DEVICE_TYPE/$f" ]; then
       cp "$script_dir/devices/$HAL_DEVICE_TYPE/$f" "$HAL_DEVICES_DIR/$HAL_DEVICE_TYPE/$f"
     else
       curl -fsSL "$INTERN_REPO_RAW/devices/$HAL_DEVICE_TYPE/$f" \
-        -o "$HAL_DEVICES_DIR/$HAL_DEVICE_TYPE/$f" \
-        || { echo "[stage] ERROR: cannot install device declaration $f"; return 1; }
+        -o "$HAL_DEVICES_DIR/$HAL_DEVICE_TYPE/$f.tmp" \
+        && mv "$HAL_DEVICES_DIR/$HAL_DEVICE_TYPE/$f.tmp" "$HAL_DEVICES_DIR/$HAL_DEVICE_TYPE/$f" \
+        || { rm -f "$HAL_DEVICES_DIR/$HAL_DEVICE_TYPE/$f.tmp"
+             echo "[stage] ERROR: cannot install device declaration $f"; return 1; }
     fi
   done
+  # Upstream renamed DEVICE.md to ROBOT.md (HAL reads either, ROBOT.md first; the runtime
+  # CTS only knows ROBOT.md). Only once ROBOT.md is in place, drop a stale DEVICE.md so
+  # there is exactly one profile — never before, or a failed fetch leaves no profile at all.
+  [ -s "$HAL_DEVICES_DIR/$HAL_DEVICE_TYPE/ROBOT.md" ] && rm -f "$HAL_DEVICES_DIR/$HAL_DEVICE_TYPE/DEVICE.md"
+  return 0
 }
 
 stage_hal() {
@@ -1775,7 +1782,7 @@ stage_hal() {
   mkdir -p "$HAL_DIR"
   rsync -a --delete --exclude '.env' --exclude '.venv' "$hal_src/" "$HAL_DIR/"
 
-  # 4. Device declaration + env. HAL mounts only what DEVICE.md declares; with no ALSA
+  # 4. Device declaration + env. HAL mounts only what ROBOT.md declares; with no ALSA
   # config on this box the optional audio capability is skipped cleanly at boot.
   install_hal_device_decl || return 1
   if [ ! -f "$HAL_DIR/.env" ]; then
@@ -1801,24 +1808,38 @@ EOF
     || { echo "[stage] ERROR: uv sync failed — HAL not installed"; return 1; }
 
   # 6b. webrtcvad ships a bare pkg_resources import that Python 3.12+ removed; upstream
-  # rewrites the module header in place after every sync. Same patch, python-applied.
+  # rewrites the whole module after every sync (scripts/provision/setup.sh). Same rewrite.
+  # Voice-only on this box (no mic), so a failure here is a WARN, not a stage failure.
   local wvad
   wvad=$(find "$HAL_DIR/.venv" -name "webrtcvad.py" -path "*/site-packages/*" 2>/dev/null | head -1 || true)
   if [ -n "$wvad" ] && grep -q "^import pkg_resources" "$wvad" 2>/dev/null; then
-    python3 - "$wvad" <<'PYPATCH' || echo "[stage] WARN: webrtcvad patch failed (VAD may not import on 3.12)"
-import sys
-p = sys.argv[1]
-src = open(p).read()
-old = "import pkg_resources\n__version__ = pkg_resources.get_distribution('webrtcvad').version"
-new = ("try:\n    import pkg_resources\n"
-       "    __version__ = pkg_resources.get_distribution('webrtcvad').version\n"
-       "except Exception:\n    __version__ = '2.0.10'")
-if old in src:
-    open(p, "w").write(src.replace(old, new))
-    print("[stage] webrtcvad patched for Python 3.12+")
-else:
-    sys.exit(1)
-PYPATCH
+    cat >"$wvad" <<'WEBRTCVAD_EOF' && echo "[stage] webrtcvad patched for Python 3.12+" \
+      || echo "[stage] WARN: webrtcvad patch failed (VAD may not import on 3.12)"
+try:
+    import pkg_resources
+    __version__ = pkg_resources.get_distribution('webrtcvad').version
+except Exception:
+    __version__ = '2.0.10'
+
+import _webrtcvad
+
+class Vad(object):
+    def __init__(self, mode=None):
+        self._vad = _webrtcvad.create()
+        _webrtcvad.init(self._vad)
+        if mode is not None:
+            self.set_mode(mode)
+    def set_mode(self, mode):
+        _webrtcvad.set_mode(self._vad, mode)
+    def is_speech(self, buf, sample_rate, length=None):
+        length = length or int(len(buf) / 2)
+        if length * 2 > len(buf):
+            raise IndexError('buffer has %s frames, but length argument was %s' % (int(len(buf) / 2.0), length))
+        return _webrtcvad.process(self._vad, sample_rate, buf, length)
+
+def valid_rate_and_frame_length(rate, frame_length):
+    return _webrtcvad.valid_rate_and_frame_length(rate, frame_length)
+WEBRTCVAD_EOF
   fi
 
   # 7. Unit. Upstream's, plus loopback-only is inherent (--host 127.0.0.1) and journald
@@ -1857,7 +1878,14 @@ EOF
   # 7. SPI handover: stop the old owners FIRST (two SPI writers = garbage frames).
   systemctl disable --now intern.service 2>/dev/null || true
   systemctl disable --now intern-gateway-shim.service 2>/dev/null || true
-  systemctl enable --now hal.service
+  # On a re-run HAL is already up, and `enable --now` is a no-op for a running unit: the
+  # 2026-09-15 pin bump left the July process serving the new tree until a manual restart.
+  # A restart is cheap (~10s, the ring goes dark then idle) and the health gate below covers it.
+  if systemctl is-active --quiet hal.service; then
+    systemctl restart hal.service
+  else
+    systemctl enable --now hal.service
+  fi
 
   # 8. Health gate: HAL must answer and the light capability must be mounted.
   local i ok=0
