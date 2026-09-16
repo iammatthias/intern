@@ -28,9 +28,16 @@ jobs:
           git -C /tmp/aos fetch --depth 1 origin "$REF"
           git -C /tmp/aos checkout -f "$REF"
       - name: run device conformance suite against our declaration
-        # The CTS hardcodes its repo-relative devices/ dir, so copy ours in; the suite
-        # then validates upstream's devices AND ours with the same parser the HAL runs.
+        # The CTS hardcodes its repo-relative robots/ dir (devices/ before upstream's
+        # 2026-08 reshuffle), so copy ours in; the suite then validates upstream's
+        # robots AND ours with the same parser the HAL runs. The runtime half of the
+        # suite needs a live HAL (CTS_HAL=...) and self-skips here.
         run: |
-          cp -r "$GITHUB_WORKSPACE/devices/intern-v1" /tmp/aos/devices/
           cd /tmp/aos
-          python3 -m unittest discover -s cts -v
+          if [ -d robots/contract/cts ]; then
+            cp -r "$GITHUB_WORKSPACE/devices/intern-v1" robots/
+            python3 -m unittest discover -s robots/contract/cts -v
+          else
+            cp -r "$GITHUB_WORKSPACE/devices/intern-v1" devices/
+            python3 -m unittest discover -s cts -v
+          fi

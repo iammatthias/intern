@@ -6,7 +6,7 @@
 #                      AP onboarding — the open HAL below replaces it once online)
 #   - Hermes agent     gateway as a systemd service, pinned to a release tag
 #                      (memory = Hermes' built-in MEMORY.md + skills/procedural; no external store)
-#   - HAL              Autonomous OS's open hardware layer (autonomous-ai/autonomous-os os/hal,
+#   - HAL              Autonomous OS's open hardware layer (autonomous-ai/autonomous-os hal/,
 #                      FastAPI on loopback :5001) drives the WS2812 ring directly with per-frame
 #                      safety clamps (brightness ceiling + quiet hours from SAFETY.md). Replaces
 #                      the closed intern-server LED path AND the :18789 gateway shim.
@@ -162,16 +162,19 @@ R1_SHIM_TOKEN="${R1_SHIM_TOKEN:-}"
 # The plugin repo, in `hermes plugins install` owner/repo shorthand (set GITHUB_TOKEN if private).
 R1_SHIM_REPO="${R1_SHIM_REPO:-iammatthias/r1-hermes-shim}"
 
-# Autonomous OS HAL — the open hardware layer (github.com/autonomous-ai/autonomous-os,
-# Developer Edition, 2026-07). os/hal is a Python FastAPI daemon on loopback :5001 that
-# drives the WS2812 directly over spidev (6.4MHz, one WS2812 bit per SPI byte) with a
-# per-frame safety clamp (max_brightness + quiet hours) read from the device's SAFETY.md.
-# We pin a commit like we pin Hermes. NOTE: os/hal is GPL-3 (LeLamp fork) — it is cloned
-# from upstream at provision time, not vendored into this repo.
+# Autonomous OS HAL — the open hardware layer (github.com/autonomous-ai/autonomous-os).
+# hal/ (os/hal/ before upstream's 2026-08 reshuffle; the sync below accepts either) is a
+# Python FastAPI daemon on loopback :5001 that drives the WS2812 directly over spidev
+# (one WS2812 bit per SPI byte) with a per-frame safety clamp (max_brightness + quiet
+# hours) read from the device's SAFETY.md. We pin a commit like we pin Hermes — currently
+# main HEAD as of 2026-09-15 (HAL 0.1.133): brings the WS2812 T1H timing fix (ff9683d51,
+# single pixels no longer latch a wrong hue at low values), clear-strip-on-boot, the
+# breathing_fine effect and /led/paint gradients. NOTE: hal is GPL-3 (LeLamp fork) — it
+# is cloned from upstream at provision time, not vendored into this repo.
 # The device declaration (devices/intern-v1/{DEVICE.md,SAFETY.md,presets.json}) IS ours,
 # installed from this repo checkout (fallback: raw.githubusercontent).
 AUTONOMOUS_OS_REPO="${AUTONOMOUS_OS_REPO:-https://github.com/autonomous-ai/autonomous-os.git}"
-AUTONOMOUS_OS_REF="${AUTONOMOUS_OS_REF:-7f1d0792aeca0a9c06244a506dab442057b1456b}"
+AUTONOMOUS_OS_REF="${AUTONOMOUS_OS_REF:-5a834bc7b7b4db446a3782c8ab46d64feb98e98c}"
 HAL_DIR="/opt/hal"
 HAL_DEVICES_DIR="/opt/devices"
 HAL_DEVICE_TYPE="${HAL_DEVICE_TYPE:-intern-v1}"
@@ -1718,7 +1721,7 @@ stage_rabbit_agent() {
 # ----------------------------------------------------------
 # HAL — Autonomous OS open hardware layer (replaces intern-server + the :18789 shim)
 # ----------------------------------------------------------
-# Installs os/hal from the pinned autonomous-os checkout into /opt/hal, declares OUR
+# Installs hal/ from the pinned autonomous-os checkout into /opt/hal, declares OUR
 # device (devices/intern-v1: light + system required, audio/sensing optional so future
 # mic/speaker hardware mounts without a re-declare), and hands the SPI bus over: HAL and
 # intern-server can NOT both own /dev/spidev0.0 (two writers interleave garbage frames),
@@ -1745,12 +1748,16 @@ install_hal_device_decl() {
 }
 
 stage_hal() {
-  echo "[stage] HAL (autonomous-os os/hal @ ${AUTONOMOUS_OS_REF:0:9}) — open LED path on :5001"
+  echo "[stage] HAL (autonomous-os hal @ ${AUTONOMOUS_OS_REF:0:9}) — open LED path on :5001"
 
   # 1. uv — installs its own CPython 3.12 + the venv. Pinned installer endpoint.
+  # Upstream's pyproject leans on newer uv features ([tool.uv] required-environments,
+  # dependency-metadata, scoped prerelease), so keep an existing uv current too.
   if ! command -v uv >/dev/null 2>&1; then
     curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh \
       || { echo "[stage] ERROR: uv install failed"; return 1; }
+  else
+    uv self update >/dev/null 2>&1 || echo "[stage] WARN: uv self update failed (continuing with $(uv --version))"
   fi
 
   # 2. Pinned upstream checkout. Shallow fetch of the exact ref (same discipline as Hermes).
@@ -1760,9 +1767,13 @@ stage_hal() {
   git -C /opt/autonomous-os fetch --depth 1 origin "$AUTONOMOUS_OS_REF"
   git -C /opt/autonomous-os checkout -f "$AUTONOMOUS_OS_REF"
 
-  # 3. Sync os/hal -> /opt/hal, preserving the env file and the venv across re-runs.
+  # 3. Sync hal/ -> /opt/hal, preserving the env file and the venv across re-runs.
+  # Upstream moved os/hal/ to hal/ in 2026-08; accept either so an older ref still works.
+  local hal_src=/opt/autonomous-os/hal
+  [ -d "$hal_src" ] || hal_src=/opt/autonomous-os/os/hal
+  [ -d "$hal_src" ] || { echo "[stage] ERROR: no hal/ or os/hal/ in the autonomous-os checkout"; return 1; }
   mkdir -p "$HAL_DIR"
-  rsync -a --delete --exclude '.env' --exclude '.venv' /opt/autonomous-os/os/hal/ "$HAL_DIR/"
+  rsync -a --delete --exclude '.env' --exclude '.venv' "$hal_src/" "$HAL_DIR/"
 
   # 4. Device declaration + env. HAL mounts only what DEVICE.md declares; with no ALSA
   # config on this box the optional audio capability is skipped cleanly at boot.
@@ -1815,7 +1826,7 @@ PYPATCH
   # SSE stream otherwise holds SIGTERM until systemd's 90s SIGKILL.
   cat >/etc/systemd/system/hal.service <<EOF
 [Unit]
-Description=HAL Hardware Runtime (autonomous-os os/hal)
+Description=HAL Hardware Runtime (autonomous-os hal)
 After=network.target
 
 [Service]

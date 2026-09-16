@@ -15,7 +15,7 @@ It's a reworked version of the stock [`setup.sh`](https://cdn.autonomous.ai/inte
 | Component | Role |
 |-----------|------|
 | **Caddy** | Serves the setup web UI on `:80`, reverse-proxies `/api/*` to `intern-server:5000`, plus a loopback `:9080` Host/Origin-rewrite hop for the dashboard |
-| **HAL** | Autonomous OS's open hardware layer ([autonomous-ai/autonomous-os](https://github.com/autonomous-ai/autonomous-os) `os/hal`, pinned commit, loopback `:5001`). Drives the WS2812 ring directly over spidev with per-frame safety clamps (brightness ceiling, quiet hours 22:00-07:00) from our `devices/intern-v1/SAFETY.md`. Replaces the closed intern-server LED path and the `:18789` gateway shim |
+| **HAL** | Autonomous OS's open hardware layer ([autonomous-ai/autonomous-os](https://github.com/autonomous-ai/autonomous-os) `hal/`, pinned commit, loopback `:5001`). Drives the WS2812 ring directly over spidev with per-frame safety clamps (brightness ceiling, quiet hours 22:00-07:00) from our `devices/intern-v1/SAFETY.md`. Replaces the closed intern-server LED path and the `:18789` gateway shim |
 | **Device contract** | `devices/intern-v1/` declares the hardware (light + system required, audio/sensing optional for future hardware); CI runs upstream's conformance suite against it |
 | **intern backend** | The Autonomous `intern-server`, now only for the captive-portal Wi-Fi onboarding API. Retired (stopped + disabled) once the device is online and HAL owns the ring |
 | **Hermes agent** | Gateway as a systemd service (`hermes-gateway`), pinned to a fixed upstream `main` commit (currently v0.20.4, the v2026.8.18 release) |
@@ -106,7 +106,7 @@ The inline comments in `setup` carry the full rationale for each stage.
 ## Credits
 
 - [autonomous-intern](https://github.com/autonomous-ai/autonomous-intern) and the stock [`setup.sh`](https://cdn.autonomous.ai/intern/setup.sh), Autonomous. This is a rework of that.
-- [autonomous-os](https://github.com/autonomous-ai/autonomous-os), Autonomous. The HAL (`os/hal`, cloned at provision time, GPL-3: it is a [LeLamp](https://github.com/humancomputerlab/LeLamp) fork), the device contract our `devices/intern-v1/` declares against, and the first-party skills our `skills/` adapt (Apache-2.0)
+- [autonomous-os](https://github.com/autonomous-ai/autonomous-os), Autonomous. The HAL (`hal/`, cloned at provision time, GPL-3: it is a [LeLamp](https://github.com/humancomputerlab/LeLamp) fork), the device contract our `devices/intern-v1/` declares against, and the first-party skills our `skills/` adapt (Apache-2.0)
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent), Nous Research
 - [Agents on rabbit r1](https://www.rabbit.tech/support/article/agents-on-rabbit-r1), rabbit's native Hermes integration, the current R1 channel
 - [r1-hermes-shim][r1-shim], the R1 channel before rabbit shipped native support (archived)
